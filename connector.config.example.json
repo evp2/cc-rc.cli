@@ -1,0 +1,8 @@
+{
+  "relayBaseUrl": "https://okykx6ve84.execute-api.us-east-1.amazonaws.com/test",
+  "_createSecretB64": "MmYyOTdiYjIyNzg1MjdhN2ZiMDlmNDg2OTMwNjU3OWM5ZTk0NWE0Nzk2ZTQwYWFl",
+  "projectDir": "",
+  "provider": {
+    "type": "anthropic"
+  }
+}
