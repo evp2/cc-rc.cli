@@ -59,6 +59,8 @@ export interface EventInput {
   is_ambient?: boolean;
   /** The full live-task set, on the changed event. REPLACE semantics. */
   tasks?: BackgroundTaskRow[];
+  /** On a `turn_complete` for a Turn that accepted a Steer -- tells the relay to skip the Web Push. */
+  no_notify?: boolean;
 }
 
 export interface CreateSessionInput {
@@ -244,6 +246,25 @@ export class RelayClient {
     await checkTerminal(res);
     if (!res.ok) {
       throw new Error(`putSkills failed: HTTP ${res.status} ${await res.text()}`);
+    }
+  }
+
+  /**
+   * Reports whether the connector currently holds a Command it has not
+   * finished -- the fact the phone's brake reads instead of guessing from the
+   * transcript. Called at each boundary of a run of work, not per poll.
+   *
+   * Throws {@link SessionEndedError} once the relay reports the session gone.
+   */
+  async setInFlight(inFlight: boolean): Promise<void> {
+    const res = await fetch(`${this.relayBaseUrl}/sessions/${this.sessionId}/in-flight`, {
+      method: "PUT",
+      headers: { "content-type": "application/json", ...this.authHeaders() },
+      body: JSON.stringify({ in_flight: inFlight }),
+    });
+    await checkTerminal(res);
+    if (!res.ok) {
+      throw new Error(`setInFlight failed: HTTP ${res.status} ${await res.text()}`);
     }
   }
 

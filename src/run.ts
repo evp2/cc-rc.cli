@@ -1,5 +1,11 @@
-import type { CanUseTool, Options, PermissionResult } from "@anthropic-ai/claude-agent-sdk";
+import type {
+  CanUseTool,
+  Options,
+  PermissionResult,
+  SDKUserMessage,
+} from "@anthropic-ai/claude-agent-sdk";
 
+import { AsyncQueue, userTextMessage } from "./asyncQueue";
 import { PERMISSION_MODE, type ConnectorConfig } from "./config";
 import { buildProviderEnv } from "./provider";
 import { query } from "./sdkClient";
@@ -156,6 +162,11 @@ export async function runConnector(config: ConnectorConfig): Promise<RunHandle> 
   })();
 
   let sdkSessionId = state.sdkSessionId;
+  // The shared command-log cursor: the main loop's own poll and the
+  // turn-scoped {@link watchForSteers} poll both read and advance this same
+  // variable, since claiming a Command -- whichever of the two claims it --
+  // must never be re-read by the other.
+  let since = state.commandCursor;
   let eventBuffer: EventInput[] = [];
   let running = true;
   // Set once the relay reports the session gone; suppresses further posting.
@@ -171,18 +182,26 @@ export async function runConnector(config: ConnectorConfig): Promise<RunHandle> 
   // old process, and re-actioning it is a harmless no-op anyway.
   let lastHandledKillAt: string | undefined;
 
-  // A turn recorded as in flight by a previous process never completed -- the
-  // connector died during it. Its cursor was already advanced, so it will not
-  // be re-run; say so rather than letting it vanish silently.
-  if (resumed?.inFlight) {
-    console.log(`Reporting turn interrupted by restart: ${resumed.inFlight.seq}`);
-    eventBuffer.push({
-      type: "error",
-      text:
-        "The previous turn was interrupted when the connector stopped, and will " +
-        "not be re-run automatically. Send it again if you still want it.",
-      is_error: true,
-    });
+  // Every Command recorded as in flight by a previous process never
+  // completed -- the connector died holding it. Cursors for all of them were
+  // already advanced, so none will be re-run; say so rather than letting them
+  // vanish silently. A `running` entry was genuinely cut off mid-turn; a
+  // `queued` one (a Steer that had been claimed, or hand-back work) never
+  // started at all, so calling it "interrupted" would say something false.
+  if (resumed?.inFlight?.length) {
+    for (const entry of resumed.inFlight) {
+      console.log(`Reporting ${entry.status} command dropped by restart: ${entry.seq}`);
+      eventBuffer.push({
+        type: "error",
+        text:
+          entry.status === "running"
+            ? "The previous turn was interrupted when the connector stopped, and will " +
+              "not be re-run automatically. Send it again if you still want it."
+            : "A queued command was dropped when the connector stopped before it ran. " +
+              "Send it again if you still want it.",
+        is_error: true,
+      });
+    }
     persist({ inFlight: undefined });
   }
 
@@ -210,6 +229,102 @@ export async function runConnector(config: ConnectorConfig): Promise<RunHandle> 
     eventBuffer.push({ type: "background_tasks_changed", tasks: [] });
     persist({ runningTasks: undefined });
   }
+
+  // Every Command the connector currently holds but has not finished, keyed
+  // by seq -- the source of both the relay-facing in-flight fact and the
+  // state file's crash-honesty record. `claim` adds an entry and advances the
+  // cursor for a Command freshly read off the relay; `promoteToRunning` and
+  // `release` move an already-claimed entry between the two without touching
+  // the cursor again.
+  const inFlightEntries = new Map<
+    string,
+    { seq: string; text: string; status: "running" | "queued" }
+  >();
+
+  function inFlightSnapshot(): ConnectorState["inFlight"] {
+    return inFlightEntries.size ? [...inFlightEntries.values()] : undefined;
+  }
+
+  /** Best-effort: a failed report leaves the phone's brake stale until the next successful one, not broken. */
+  async function reportInFlight(inFlight: boolean): Promise<void> {
+    try {
+      await client.setInFlight(inFlight);
+    } catch (e) {
+      if (e instanceof SessionEndedError) return;
+      console.error("Failed to report in-flight state:", (e as Error).message);
+    }
+  }
+
+  /**
+   * Claims a Command freshly read off the relay: advances the shared cursor
+   * and adds it to the in-flight set. Reports in-flight to the relay exactly
+   * once, on the transition from holding nothing to holding something, so a
+   * run of queued work reads as continuous rather than flickering.
+   */
+  async function claim(command: CommandRecord, status: "running" | "queued"): Promise<void> {
+    const wasEmpty = inFlightEntries.size === 0;
+    inFlightEntries.set(command.seq, { seq: command.seq, text: command.text, status });
+    since = command.seq;
+    persist({ commandCursor: command.seq, inFlight: inFlightSnapshot() });
+    if (wasEmpty) await reportInFlight(true);
+  }
+
+  /** Moves an already-claimed Command to `running` -- no cursor movement, since claiming it already advanced the cursor. */
+  function promoteToRunning(seq: string): void {
+    const entry = inFlightEntries.get(seq);
+    if (!entry) return;
+    entry.status = "running";
+    persist({ inFlight: inFlightSnapshot() });
+  }
+
+  /** A Command's Turn has ended (or it was discarded). Reports in-flight false exactly on the transition to holding nothing. */
+  async function release(seq: string): Promise<void> {
+    if (!inFlightEntries.delete(seq)) return;
+    persist({ inFlight: inFlightSnapshot() });
+    if (inFlightEntries.size === 0) await reportInFlight(false);
+  }
+
+  /**
+   * Reported the moment it happens, not at a later restart -- a brake that
+   * starts fresh work is not a brake, and no restart is coming to explain a
+   * sentence that just vanished while the human was watching the screen.
+   */
+  async function discard(seq: string): Promise<void> {
+    const entry = inFlightEntries.get(seq);
+    eventBuffer.push({
+      type: "error",
+      text: entry
+        ? `Discarded by Stop before it ran: ${entry.text}`
+        : "Discarded by Stop before it ran.",
+      is_error: true,
+    });
+    await release(seq);
+  }
+
+  // In-memory only, by design: a Command the current Turn was too late to
+  // accept (or found alongside the one Steer it already took) goes back to
+  // the main loop here and runs as an ordinary Turn before the next relay
+  // poll -- not rewound, not re-fetched. An evicted process loses whatever is
+  // queued here, the same class of loss a laptop crash already reports via
+  // `inFlight`'s `queued` entries above.
+  const handBackBuffer: CommandRecord[] = [];
+
+  // Set while a `canUseTool` call is holding a Turn open on a pending
+  // Question, so {@link watchForSteers} knows not to advance the cursor over
+  // a Command the stalled Turn cannot read yet.
+  let questionPending = false;
+
+  /** The Turn currently executing, if any -- shared between {@link runTurn} and {@link watchForSteers}. */
+  interface CurrentTurn {
+    abortController: AbortController;
+    /** The Command whose entry in {@link inFlightEntries} is `running` right now. */
+    activeSeq: string;
+    /** Whether this specific sub-turn has already taken its one allowed Steer. */
+    steeredThisSubTurn: boolean;
+    /** Set the instant a Steer is streamed in, cleared once its fresh `system:init` confirms it landed. */
+    pendingSteerSeq?: string;
+  }
+  let currentTurn: CurrentTurn | undefined;
 
   /**
    * Keeps {@link runningTasks} (and the state file) in step with the
@@ -245,7 +360,12 @@ export async function runConnector(config: ConnectorConfig): Promise<RunHandle> 
   // unset genuinely has nothing live to act on -- the subprocess that would
   // have owned the task is gone -- and is retried every tick until either a
   // new turn supplies one or the connector shuts down.
-  let currentQuery: { stopTask(taskId: string): Promise<void> } | undefined;
+  let currentQuery:
+    | {
+        stopTask(taskId: string): Promise<void>;
+        streamInput(stream: AsyncIterable<SDKUserMessage>): Promise<void>;
+      }
+    | undefined;
 
   /**
    * Actions a phone's Kill against whichever Query is currently live, running
@@ -278,10 +398,84 @@ export async function runConnector(config: ConnectorConfig): Promise<RunHandle> 
     return () => clearInterval(timer);
   }
 
+  /**
+   * Turn-scoped in spirit, persistent in shape -- ticking for the connector's
+   * whole lifetime like {@link watchForKills}, but a no-op whenever
+   * `currentTurn` is unset, which is most of the time between Turns. Sharing
+   * one persistent timer is simpler than starting and stopping a fresh one
+   * per Turn, and correctness comes from the `currentTurn`/`questionPending`
+   * checks below, not from when the timer itself runs.
+   *
+   * Finds at most one Command to Steer with per tick, and only when this
+   * sub-turn hasn't already taken one. Everything else the poll returns --
+   * later Commands in the same batch, or any Command once the one Steer is
+   * spent -- goes to the hand-back buffer and runs in order as ordinary Turns
+   * once the current one ends.
+   */
+  function watchForSteers(): () => void {
+    const timer = setInterval(() => {
+      void (async () => {
+        const turn = currentTurn;
+        if (!turn || !currentQuery) return;
+        if (turn.abortController.signal.aborted) return;
+        if (questionPending) return;
+
+        let commands: CommandRecord[];
+        try {
+          commands = await client.pollCommands(since);
+        } catch (e) {
+          if (!(e instanceof SessionEndedError)) {
+            console.error("Steer poll failed:", (e as Error).message);
+          }
+          return;
+        }
+        if (commands.length === 0) return;
+        // Stop or a Question can have landed while that poll was in flight --
+        // re-check against the same turn this tick started for, not fresh
+        // globals, so a stale response from a query started under a Turn that
+        // has since ended can never mis-claim anything.
+        if (currentTurn !== turn || turn.abortController.signal.aborted || questionPending) {
+          return;
+        }
+
+        const [first, ...rest] = commands;
+        if (!turn.steeredThisSubTurn) {
+          turn.steeredThisSubTurn = true;
+          turn.pendingSteerSeq = first.seq;
+          await claim(first, "queued");
+          if (turn.abortController.signal.aborted) {
+            // Stop landed in the gap between claiming and streaming it in --
+            // discard rather than deliver into a query that is already ending.
+            turn.pendingSteerSeq = undefined;
+            await discard(first.seq);
+          } else {
+            const steerInput = new AsyncQueue<SDKUserMessage>();
+            steerInput.push(userTextMessage(first.text, { priority: "now" }));
+            steerInput.close();
+            try {
+              await currentQuery.streamInput(steerInput);
+            } catch (e) {
+              console.error("Failed to stream a Steer into the turn:", (e as Error).message);
+            }
+          }
+        } else {
+          await claim(first, "queued");
+          handBackBuffer.push(first);
+        }
+        for (const extra of rest) {
+          await claim(extra, "queued");
+          handBackBuffer.push(extra);
+        }
+      })();
+    }, INTERRUPT_POLL_INTERVAL_MS);
+    return () => clearInterval(timer);
+  }
+
   const flushTimer = setInterval(() => {
     void flushEvents();
   }, FLUSH_INTERVAL_MS);
   const stopWatchingKills = watchForKills();
+  const stopWatchingSteers = watchForSteers();
 
   /**
    * Posts the buffer in relay-sized chunks, oldest first. Events are only
@@ -422,12 +616,35 @@ export async function runConnector(config: ConnectorConfig): Promise<RunHandle> 
    */
   const canUseTool: CanUseTool = async (toolName, input, toolOpts) => {
     if (toolName !== "AskUserQuestion") return { behavior: "allow", updatedInput: input };
-    return waitForAnswer(input, toolOpts.toolUseID, toolOpts.signal);
+    // A Turn stalled here cannot look at a Steer until this resolves --
+    // watchForSteers reads this to leave the cursor alone rather than
+    // advancing it over a Command nothing will read yet.
+    questionPending = true;
+    try {
+      return await waitForAnswer(input, toolOpts.toolUseID, toolOpts.signal);
+    } finally {
+      questionPending = false;
+    }
   };
 
+  /**
+   * Runs a Turn to completion -- which, once a Steer lands, is really a chain
+   * of Turns inside one query: this keeps draining the same generator across
+   * the seam, promoting whichever Command the SDK's fresh `system:init`
+   * confirms it moved on to, until a sub-turn ends having taken no further
+   * Steer.
+   */
   async function runTurn(command: CommandRecord): Promise<void> {
     const text = command.text;
     const abortController = new AbortController();
+    currentTurn = { abortController, activeSeq: command.seq, steeredThisSubTurn: false };
+    // Streaming-input mode: the prompt is an async iterable rather than the
+    // plain text, held open for the turn's duration. Nothing else feeds it
+    // yet -- that's what lets a later Command be streamed into a Turn already
+    // running (a Steer) instead of restarting the query, which the SDK only
+    // accepts a mid-turn message into when the query began this way.
+    const input = new AsyncQueue<SDKUserMessage>();
+    input.push(userTextMessage(text));
     const options: Options = {
       // Without this the SDK sends a minimal system prompt that never states
       // the working directory, so `cwd` below is honoured by the subprocess but
@@ -456,7 +673,7 @@ export async function runConnector(config: ConnectorConfig): Promise<RunHandle> 
     let sawResult = false;
     try {
       if (abortController.signal.aborted) throw new Error("stopped before starting");
-      const activeQuery = query({ prompt: text, options });
+      const activeQuery = query({ prompt: input, options });
       // Live for the persistent kill-watcher to act against for as long as
       // this turn's subprocess is -- which can outlast the turn's own
       // `result` while one of its Background tasks is still running.
@@ -465,6 +682,18 @@ export async function runConnector(config: ConnectorConfig): Promise<RunHandle> 
         if (message.type === "system" && message.subtype === "init") {
           sdkSessionId = message.session_id;
           persist({ sdkSessionId });
+          // A second (or third, ...) `init` inside this same query means a
+          // Steer just landed: promote whichever Command was streamed in to
+          // `running` and make it the one this loop is now tracking. A no-op
+          // on the very first `init`, where nothing is pending yet.
+          if (currentTurn?.pendingSteerSeq) {
+            promoteToRunning(currentTurn.pendingSteerSeq);
+            currentTurn.activeSeq = currentTurn.pendingSteerSeq;
+            currentTurn.pendingSteerSeq = undefined;
+          }
+          // Each sub-turn gets its own allowance to be Steered again -- a
+          // steered exchange is a conversation, not a single correction.
+          if (currentTurn) currentTurn.steeredThisSubTurn = false;
           // Refresh from a subprocess already running this turn -- free, since
           // supportedCommands() just reads the initialize response it already
           // has. Skills discovered mid-session (e.g. the agent cd's into a
@@ -481,8 +710,28 @@ export async function runConnector(config: ConnectorConfig): Promise<RunHandle> 
             )
             .catch((e) => console.error("Failed to refresh skills:", (e as Error).message));
         }
-        if (message.type === "result") sawResult = true;
+        // Set before mapping this message, so both the "steered" marker and
+        // the no-push flag below read the same fact: a Steer was streamed in
+        // and not yet confirmed at the moment this sub-turn's own outcome
+        // arrived. Neutral wording, not "interrupted" -- a Steer can also
+        // land just as a Turn was finishing on its own, and only "steered" is
+        // true in both cases.
+        const steered = message.type === "result" && !!currentTurn?.pendingSteerSeq;
+        if (message.type === "result") {
+          sawResult = true;
+          // This sub-turn just ended. If a Steer landed, its entry is already
+          // in the in-flight set (added `queued` by watchForSteers) and gets
+          // promoted on the next `init` above, so releasing this one doesn't
+          // make the relay-facing fact flicker false in between.
+          if (currentTurn) await release(currentTurn.activeSeq);
+        }
         const mapped = mapMessage(message);
+        if (steered) {
+          for (const evt of mapped) {
+            if (evt.type === "turn_complete") evt.no_notify = true;
+          }
+          eventBuffer.push({ type: "status", text: "steered" });
+        }
         trackBackgroundTasks(mapped);
         eventBuffer.push(...mapped);
       }
@@ -502,6 +751,10 @@ export async function runConnector(config: ConnectorConfig): Promise<RunHandle> 
         }
       }
     } finally {
+      // Nothing else will ever feed this turn's prompt once it has settled --
+      // closing it lets the stream end cleanly instead of leaving the SDK
+      // holding an input source that will never produce anything further.
+      input.close();
       stopWatching();
       // The generator is drained (or aborted) by this point, so its subprocess
       // is done and there is nothing left for a Kill to act against here.
@@ -518,6 +771,23 @@ export async function runConnector(config: ConnectorConfig): Promise<RunHandle> 
           });
         }
       }
+      if (currentTurn) {
+        // A Steer streamed in but never confirmed by a fresh `init` before
+        // this query ended. Stop ending the query is the only case this
+        // reports right now: the brake starting fresh work is not a brake, so
+        // it must not be left to run and cannot wait for a restart that isn't
+        // coming. Any other unconfirmed case (a genuine crash) is instead
+        // left in the in-flight set for the next start to report -- it is
+        // still there, `queued`, since nothing here removes it.
+        if (currentTurn.pendingSteerSeq && abortController.signal.aborted) {
+          await discard(currentTurn.pendingSteerSeq);
+        }
+        // Idempotent: already released by the `result` handling above in the
+        // ordinary case, so this only does anything for an abort or an
+        // unexpected error that left the active entry behind.
+        await release(currentTurn.activeSeq);
+      }
+      currentTurn = undefined;
     }
   }
 
@@ -539,6 +809,7 @@ export async function runConnector(config: ConnectorConfig): Promise<RunHandle> 
     running = false;
     clearInterval(flushTimer);
     stopWatchingKills();
+    stopWatchingSteers();
     if (!sessionEnded) await flushEvents().catch(() => undefined);
     resolveDone();
   }
@@ -550,8 +821,18 @@ export async function runConnector(config: ConnectorConfig): Promise<RunHandle> 
   process.on("SIGTERM", onSignal);
 
   void (async () => {
-    let since = state.commandCursor;
     while (running) {
+      // Work already claimed but not yet run -- a Steer's turn found more
+      // than it could accept, or claimed something in the gap the cursor
+      // rule opens. Drained in the order it was claimed, before the relay is
+      // polled again, so it is never rewound, re-fetched, or dropped.
+      while (handBackBuffer.length > 0 && running) {
+        const command = handBackBuffer.shift()!;
+        promoteToRunning(command.seq);
+        await runTurn(command);
+      }
+      if (!running) break;
+
       let commands;
       try {
         commands = await client.pollCommands(since);
@@ -567,10 +848,8 @@ export async function runConnector(config: ConnectorConfig): Promise<RunHandle> 
         // The cursor advances *before* the turn runs, so a connector that dies
         // mid-turn never re-runs it against a tree it has already half-changed.
         // `inFlight` is what lets the next start report that it was dropped.
-        since = command.seq;
-        persist({ commandCursor: command.seq, inFlight: { seq: command.seq, text: command.text } });
+        await claim(command, "running");
         await runTurn(command);
-        persist({ inFlight: undefined });
       }
 
       if (running) await sleep(POLL_INTERVAL_MS);

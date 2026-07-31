@@ -40,11 +40,16 @@ export interface ConnectorState {
    */
   commandCursor?: string;
   /**
-   * The command currently being executed. Present in a state file left behind
-   * by a crash, which is the only way the connector can tell that a turn was
-   * interrupted rather than completed.
+   * Every Command the connector currently holds but has not finished --
+   * whichever one is actually executing (`running`), plus any claimed by a
+   * poll (a Steer, or extra work found alongside it) but not yet started
+   * (`queued`) via the hand-back buffer. Present in a state file left behind
+   * by a crash, which is the only way the connector can tell what was
+   * interrupted versus never run at all: a `running` entry was truly cut
+   * off mid-turn, while a `queued` one never touched the tree, so reporting
+   * both as "interrupted" would say something false about the queued one.
    */
-  inFlight?: { seq: string; text: string };
+  inFlight?: { seq: string; text: string; status: "running" | "queued" }[];
   /** Claude's own session id, resumed across turns. Dropped when rotating. */
   sdkSessionId?: string;
   /**

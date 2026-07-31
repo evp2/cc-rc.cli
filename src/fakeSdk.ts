@@ -12,6 +12,8 @@ import type {
   query as realQuery,
 } from "@anthropic-ai/claude-agent-sdk";
 
+import { AsyncQueue, takeOne, textOf } from "./asyncQueue";
+
 /**
  * Test-only replacements for the SDK's `query()`, selected by `CRC_FAKE_SDK`
  * (see sdkClient.ts). Each persona replays a fixed, scripted `SDKMessage`
@@ -299,6 +301,196 @@ async function* askUserQuestionPersona(
   yield resultSuccess();
 }
 
+/** Resolves once `signal` aborts -- already-aborted resolves immediately. */
+function onAbort(signal: AbortSignal): Promise<{ kind: "abort" }> {
+  if (signal.aborted) return Promise.resolve({ kind: "abort" });
+  return new Promise((resolve) => {
+    signal.addEventListener("abort", () => resolve({ kind: "abort" }), { once: true });
+  });
+}
+
+// Comfortably longer than the connector's steer-poll interval (1s) plus the
+// round trip a test needs to *observe* this sub-turn has started before it
+// can act -- the relay flush (750ms) and the phone's own event poll (2s) sit
+// between "the persona is paused" and "a test script can tell." Too short a
+// window here doesn't fail loudly; it just makes a Steer arrive a moment too
+// late and silently exercises the un-steered path instead.
+const STEER_PAUSE_MS = 8000;
+
+/**
+ * Waits, after one simulated tool call, for whichever comes first: a message
+ * streamed in via the mailbox (a Steer landing), the turn's own abort signal
+ * (Stop), or the pause simply timing out (nothing was sent). Mirrors what the
+ * real SDK's `canUseTool`/`streamInput` seam gives the connector -- parked
+ * here is exactly a Turn "genuinely working" that a Steer can reach.
+ */
+async function pauseForSteer(
+  mailbox: AsyncQueue<SDKUserMessage>,
+  signal: AbortSignal | undefined,
+): Promise<{ kind: "abort" } | { kind: "timeout" } | { kind: "steer"; message: SDKUserMessage }> {
+  const steered = takeOne(mailbox).then((message) =>
+    message ? ({ kind: "steer", message } as const) : undefined,
+  );
+  const timedOut = sleep(STEER_PAUSE_MS).then(() => ({ kind: "timeout" as const }));
+  const racers = signal ? [steered, timedOut, onAbort(signal)] : [steered, timedOut];
+  const result = await Promise.race(racers);
+  if (!result) throw new Error("mailbox closed without a message");
+  return result;
+}
+
+// The first sub-turn (the original Command's own plan) works through this
+// many steps before finishing on its own if nothing Steers it -- enough to
+// prove a Steer mid-sequence really does abandon a step that would otherwise
+// have run (never-emitted "step-2" text is what the specs check for), without
+// multiplying by STEER_PAUSE_MS into an unreasonably long wait for the specs
+// that let one run unsteered to completion. A sub-turn replying to an
+// already-accepted Steer gets only one step: enough to be genuinely "working"
+// and reachable by a further Steer, without making every hand-back test wait
+// out a multi-step cool-down it has no reason to care about.
+const FIRST_SUBTURN_STEPS = 2;
+const REPLY_SUBTURN_STEPS = 1;
+
+/**
+ * The Turn's simulated work, as a chain of sub-turns: the original Command's
+ * plan, and then one more per Steer accepted, each pausing after every step
+ * long enough for the next Steer to land. This is the persona-side half of
+ * the hand-back race -- the generator, not a timer, decides exactly when the
+ * Turn is far enough along to accept one.
+ *
+ * A Steer landing truncates the current sub-turn at that tool-call boundary
+ * (no further steps in its plan run) and starts a fresh one announcing it,
+ * so a conversation can Steer more than once. A sub-turn that exhausts its
+ * steps with nothing sent finishes the Turn normally. Stop ends the
+ * generator outright, mid-pause or mid-confirm.
+ */
+async function* subTurnLoop(
+  options: Options,
+  mailbox: AsyncQueue<SDKUserMessage>,
+  opts: {
+    /**
+     * Delays between a Steer landing and this generator confirming it with a
+     * fresh `system:init` -- widening the connector's real, normally
+     * sub-millisecond window between streaming a Steer in and the SDK
+     * confirming it accepted, so a test can land Stop inside it reliably and
+     * exercise the discard-by-Stop path deterministically rather than racing
+     * real timing.
+     */
+    confirmDelayMs?: number;
+  } = {},
+): AsyncGenerator<SDKMessage, void> {
+  const signal = options.abortController?.signal;
+  // Set once a Steer is accepted, and announced as the first thing the next
+  // sub-turn says -- reset to the reply allowance from then on.
+  let announce: SDKUserMessage | undefined;
+  let maxSteps = FIRST_SUBTURN_STEPS;
+
+  for (;;) {
+    if (announce) {
+      yield assistantText(`steered: ${textOf(announce)}`);
+      announce = undefined;
+      maxSteps = REPLY_SUBTURN_STEPS;
+    }
+
+    let steered: SDKUserMessage | undefined;
+    for (let step = 1; step <= maxSteps && !steered; step++) {
+      const toolUseId = `toolu_${randomUUID()}`;
+      yield assistantToolUse(toolUseId, "Bash", { command: `echo step-${step}` });
+      yield userToolResult(toolUseId, `step-${step}`);
+
+      const outcome = await pauseForSteer(mailbox, signal);
+      if (outcome.kind === "abort") return;
+      if (outcome.kind === "steer") steered = outcome.message;
+    }
+
+    if (!steered) {
+      yield assistantText("finished without being steered further");
+      yield resultSuccess();
+      return;
+    }
+
+    if (opts.confirmDelayMs) {
+      // Observable the instant the Steer is received, before the artificial
+      // hold -- a test exercising the discard-by-Stop race waits for this
+      // rather than guessing when the hold started from wall-clock alone.
+      yield assistantText("holding before confirm");
+      await sleep(opts.confirmDelayMs);
+    }
+    if (signal?.aborted) return;
+
+    yield resultSuccess(); // this sub-turn ends, having said nothing further
+    yield systemInit(); // the Steer's own sub-turn begins, same query
+    announce = steered;
+    // Loop back: the reply about to be announced is itself steppable and
+    // steerable, not an instant, un-interruptible finish.
+  }
+}
+
+/** A Turn that works through a sequence of steps a Steer can land on. See {@link subTurnLoop}. */
+async function* steeringPersona(
+  options: Options,
+  mailbox: AsyncQueue<SDKUserMessage>,
+): AsyncGenerator<SDKMessage, void> {
+  yield systemInit();
+  yield* subTurnLoop(options, mailbox);
+}
+
+/** Like {@link steeringPersona}, but see `confirmDelayMs` on {@link subTurnLoop}. */
+async function* steeringSlowConfirmPersona(
+  options: Options,
+  mailbox: AsyncQueue<SDKUserMessage>,
+): AsyncGenerator<SDKMessage, void> {
+  yield systemInit();
+  // Long enough that a test can wait to *observe* "holding before confirm"
+  // rendered on the phone -- itself a relay flush (750ms) plus an event poll
+  // (2s) after the persona actually said it -- and still click Stop with
+  // room to spare before this window closes on its own.
+  yield* subTurnLoop(options, mailbox, { confirmDelayMs: 6000 });
+}
+
+/**
+ * Asks a Question first, the way askUserQuestionPersona does, then -- once
+ * Answered -- enters {@link subTurnLoop}. Exercises "a Command sent during
+ * the Question steers the Turn normally once the Answer releases it": the
+ * Question and the step loop are two distinct phases of one Turn, and only
+ * the second one ever reads the mailbox.
+ */
+async function* steeringWithQuestionPersona(
+  options: Options,
+  mailbox: AsyncQueue<SDKUserMessage>,
+): AsyncGenerator<SDKMessage, void> {
+  yield systemInit();
+  const toolUseId = `toolu_${randomUUID()}`;
+  const input = {
+    questions: [
+      {
+        question: "Proceed?",
+        header: "Confirm",
+        options: [{ label: "Yes", description: "Go ahead." }],
+        multiSelect: false,
+      },
+    ],
+  };
+  yield assistantToolUse(toolUseId, "AskUserQuestion", input);
+
+  const signal = options.abortController?.signal ?? new AbortController().signal;
+  const result: PermissionResult | null = options.canUseTool
+    ? await options.canUseTool("AskUserQuestion", input, {
+        signal,
+        toolUseID: toolUseId,
+        requestId: `fake-req-${toolUseId}`,
+      })
+    : null;
+  if (signal.aborted) return;
+
+  if (result?.behavior !== "allow") {
+    yield userToolResult(toolUseId, result?.message ?? "denied", true);
+    yield resultSuccess();
+    return;
+  }
+  yield userToolResult(toolUseId, JSON.stringify(result.updatedInput ?? {}));
+  yield* subTurnLoop(options, mailbox);
+}
+
 /**
  * Stands in for smoke.spec.ts's real turns: writes/appends to e2e-proof.txt
  * under `options.cwd` itself (the real SDK's subprocess does this, not the
@@ -357,13 +549,33 @@ function scriptFor(
   persona: string,
   prompt: string | AsyncIterable<SDKUserMessage>,
   options: Options,
+  mailbox: AsyncQueue<SDKUserMessage>,
 ): AsyncGenerator<SDKMessage, void> {
-  if (typeof prompt !== "string") {
-    // The skill-discovery probe's never-yielding prompt: supportedCommands()
-    // resolves independently of the message stream, so nothing needs to be
-    // emitted here.
-    return (async function* () {})();
-  }
+  if (typeof prompt === "string") return dispatch(persona, prompt, options, mailbox);
+  // Streaming-input mode (run.ts): the initial text is the first message on
+  // the iterable rather than the prompt itself. Reading it is deferred inside
+  // the generator so a query that is never iterated -- the skill-discovery
+  // probe's never-yielding prompt, whose supportedCommands() resolves
+  // independently of the message stream -- never runs this at all.
+  return (async function* () {
+    const first = await takeOne(prompt);
+    if (first === undefined) return;
+    yield* dispatch(persona, textOf(first), options, mailbox);
+  })();
+}
+
+/**
+ * `mailbox` carries whatever a live Turn's `streamInput` injects mid-flight
+ * (the steering seam, from here on). No current persona reads it -- this is
+ * the "a persona that ignores the mailbox behaves exactly as it does today"
+ * case the plumbing exists to support without a behaviour change.
+ */
+function dispatch(
+  persona: string,
+  prompt: string,
+  options: Options,
+  mailbox: AsyncQueue<SDKUserMessage>,
+): AsyncGenerator<SDKMessage, void> {
   switch (persona) {
     case "local-commands":
       return localCommandsPersona(prompt);
@@ -375,6 +587,12 @@ function scriptFor(
       return multiToolTurnPersona();
     case "background-tasks":
       return backgroundTasksPersona();
+    case "steering":
+      return steeringPersona(options, mailbox);
+    case "steering-with-question":
+      return steeringWithQuestionPersona(options, mailbox);
+    case "steering-slow-confirm":
+      return steeringSlowConfirmPersona(options, mailbox);
     default:
       throw new Error(`Unknown CRC_FAKE_SDK persona: '${persona}'`);
   }
@@ -397,6 +615,9 @@ const FAKE_SUPPORTED_COMMANDS: Record<string, SlashCommand[]> = {
   smoke: [],
   "multi-tool-turn": [],
   "background-tasks": [],
+  steering: [],
+  "steering-with-question": [],
+  "steering-slow-confirm": [],
 };
 
 function sleep(ms: number): Promise<void> {
@@ -404,7 +625,11 @@ function sleep(ms: number): Promise<void> {
 }
 
 /** Builds a `Query`-shaped object around a plain async generator, adding the handful of methods the connector actually calls. */
-function buildQuery(gen: AsyncGenerator<SDKMessage, void>, commands: SlashCommand[]): Query {
+function buildQuery(
+  gen: AsyncGenerator<SDKMessage, void>,
+  commands: SlashCommand[],
+  mailbox: AsyncQueue<SDKUserMessage>,
+): Query {
   const q = {
     [Symbol.asyncIterator]() {
       return q;
@@ -417,11 +642,22 @@ function buildQuery(gen: AsyncGenerator<SDKMessage, void>, commands: SlashComman
     // Background task. The fake persona settles its own tasks on a timer, so
     // this only needs to not throw -- the real SDK is what actually stops one.
     stopTask: async (): Promise<void> => undefined,
+    // Mirrors the real SDK's Query.streamInput: the connector's turn-scoped
+    // poller (the steering seam) calls this to inject a mid-turn Command.
+    // Draining into the mailbox rather than yielding straight into `gen`
+    // matches the real shape -- input and output are separate streams -- and
+    // leaves it up to the persona whether and when to react.
+    streamInput: async (stream: AsyncIterable<SDKUserMessage>): Promise<void> => {
+      for await (const message of stream) mailbox.push(message);
+    },
   };
   return q as unknown as Query;
 }
 
 export function fakeQuery(persona: string): typeof realQuery {
-  return ({ prompt, options }) =>
-    buildQuery(scriptFor(persona, prompt, options ?? {}), FAKE_SUPPORTED_COMMANDS[persona] ?? []);
+  return ({ prompt, options }) => {
+    const mailbox = new AsyncQueue<SDKUserMessage>();
+    const gen = scriptFor(persona, prompt, options ?? {}, mailbox);
+    return buildQuery(gen, FAKE_SUPPORTED_COMMANDS[persona] ?? [], mailbox);
+  };
 }

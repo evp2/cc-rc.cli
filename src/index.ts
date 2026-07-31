@@ -224,8 +224,12 @@ async function status(config: ConnectorConfig): Promise<void> {
   console.log(`process       ${alive ? `running (pid ${state.pid})` : `not running (last pid ${state.pid})`}`);
   console.log(`started at    ${state.startedAt}`);
   if (state.lastError) console.log(`last error    ${state.lastError}`);
-  if (state.inFlight) {
-    console.log(`in flight     ${state.inFlight.seq} (will be reported as interrupted, not re-run)`);
+  for (const entry of state.inFlight ?? []) {
+    const fate =
+      entry.status === "running"
+        ? "will be reported as interrupted, not re-run"
+        : "will be reported as dropped, never ran";
+    console.log(`in flight     ${entry.seq} (${fate})`);
   }
 
   try {
