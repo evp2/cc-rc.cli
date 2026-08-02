@@ -1,15 +1,10 @@
-// The shebang is injected by build.mjs, not written here -- a second one in the
-// source lands on line 2 of the bundle, where Node no longer strips it and it
-// is a syntax error.
 import { spawn } from "node:child_process";
 import { closeSync, openSync, readFileSync } from "node:fs";
-import { parseArgs } from "node:util";
-import { resolve } from "node:path";
 
-import { loadConfig, type ConnectorConfig } from "./config";
-import { printPairingQrCode } from "./qr";
-import { RelayClient, SessionEndedError } from "./relayClient";
-import { runConnector } from "./run";
+import type { ConnectorConfig } from "../config";
+import { printPairingQrCode } from "../qr";
+import { RelayClient, SessionEndedError } from "../relay/client";
+import { runConnector } from "../session/loop";
 import {
   ensureStateDir,
   isProcessAlive,
@@ -18,67 +13,13 @@ import {
   readState,
   statePath,
   writeState,
-} from "./state";
-
-const USAGE = `crc -- claude-remote-control connector
-
-Usage:
-  crc start   [--config <path>]   Start a connector in the background
-  crc stop    [--config <path>] [--end]
-                                  Stop the background connector. --end also
-                                  ends the session, forcing a re-pair.
-  crc status  [--config <path>]   Report connector and session health
-  crc qr      [--config <path>]   Re-print the pairing URL and QR code
-  crc run     [--config <path>]   Run in the foreground (Ctrl-C to stop)
-
-With no subcommand, crc runs in the foreground.
-`;
+} from "../state";
 
 // How long `crc start` waits for the detached process to publish a session.
 const START_TIMEOUT_MS = 45_000;
 const START_POLL_MS = 250;
 
-async function main(): Promise<void> {
-  const argv = process.argv.slice(2);
-  const known = ["start", "stop", "status", "qr", "run"];
-  const subcommand = argv[0] && !argv[0].startsWith("-") ? argv[0] : "run";
-  const rest = subcommand === argv[0] ? argv.slice(1) : argv;
-
-  if (subcommand === "help" || rest.includes("--help") || rest.includes("-h")) {
-    process.stdout.write(USAGE);
-    return;
-  }
-  if (!known.includes(subcommand)) {
-    throw new Error(`Unknown subcommand '${subcommand}'.\n\n${USAGE}`);
-  }
-
-  const { values } = parseArgs({
-    args: rest,
-    options: {
-      config: { type: "string", short: "c", default: "./connector.config.json" },
-      end: { type: "boolean", default: false },
-    },
-    allowPositionals: false,
-  });
-
-  const configPath = resolve(values.config as string);
-  const config = loadConfig(configPath);
-
-  switch (subcommand) {
-    case "run":
-      return runForeground(config);
-    case "start":
-      return start(config, configPath);
-    case "stop":
-      return stop(config, values.end as boolean);
-    case "status":
-      return status(config);
-    case "qr":
-      return qr(config);
-  }
-}
-
-async function runForeground(config: ConnectorConfig): Promise<void> {
+export async function runForeground(config: ConnectorConfig): Promise<void> {
   const existing = liveConnector(config.projectDir);
   if (existing && existing.pid !== process.pid) {
     throw new Error(
@@ -104,7 +45,7 @@ async function runForeground(config: ConnectorConfig): Promise<void> {
  * The state file is the handoff: the child's stdout goes to a log, so the
  * parent cannot scrape it for the phone URL the way a foreground run prints it.
  */
-async function start(config: ConnectorConfig, configPath: string): Promise<void> {
+export async function start(config: ConnectorConfig, configPath: string): Promise<void> {
   const existing = liveConnector(config.projectDir);
   if (existing) {
     console.log(`Already running for ${config.projectDir} (pid ${existing.pid}).`);
@@ -157,7 +98,7 @@ async function start(config: ConnectorConfig, configPath: string): Promise<void>
   );
 }
 
-async function stop(config: ConnectorConfig, end: boolean): Promise<void> {
+export async function stop(config: ConnectorConfig, end: boolean): Promise<void> {
   const state = readState(config.projectDir);
   if (!state) {
     console.log(`No connector state for ${config.projectDir}. Nothing to stop.`);
@@ -208,7 +149,7 @@ async function stop(config: ConnectorConfig, end: boolean): Promise<void> {
  * process may be alive while the relay has not heard from it, and the session
  * may be perfectly valid with no process running at all.
  */
-async function status(config: ConnectorConfig): Promise<void> {
+export async function status(config: ConnectorConfig): Promise<void> {
   const state = readState(config.projectDir);
   console.log(`project dir   ${config.projectDir}`);
   console.log(`state file    ${statePath(config.projectDir)}`);
@@ -271,7 +212,7 @@ async function status(config: ConnectorConfig): Promise<void> {
  * transcript back. Rotating is deliberately not offered here -- it is
  * `crc stop --end` followed by `crc start`.
  */
-async function qr(config: ConnectorConfig): Promise<void> {
+export async function qr(config: ConnectorConfig): Promise<void> {
   const state = readState(config.projectDir);
   if (!state) {
     throw new Error(
@@ -310,8 +251,3 @@ function tailLog(path: string, lines: number): string {
 function sleep(ms: number): Promise<void> {
   return new Promise((res) => setTimeout(res, ms));
 }
-
-main().catch((e) => {
-  console.error((e as Error).message);
-  process.exit(1);
-});

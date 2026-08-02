@@ -13,7 +13,7 @@
   ],
   "scripts": {
     "build": "node build.mjs",
-    "start": "tsx src/index.ts",
+    "start": "tsx src/cli/index.ts",
     "typecheck": "tsc --noEmit",
     "prepublishOnly": "npm run typecheck && npm run build"
   },

@@ -1,6 +1,6 @@
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 
-import type { EventInput } from "./relayClient";
+import type { EventInput } from "../relay/client";
 
 /**
  * Maps one streamed SDKMessage to zero or more relay output events. A single

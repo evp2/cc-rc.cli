@@ -1,8 +1,8 @@
 import type { Options, SlashCommand } from "@anthropic-ai/claude-agent-sdk";
 
 import { PERMISSION_MODE } from "./config";
-import type { SkillInfo } from "./relayClient";
-import { query } from "./sdkClient";
+import type { SkillInfo } from "./relay/client";
+import { query } from "./sdk/client";
 
 /**
  * Keeps only the skills the user installed -- project-scoped ones from

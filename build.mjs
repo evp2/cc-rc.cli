@@ -2,7 +2,7 @@ import * as esbuild from "esbuild";
 import { chmodSync } from "node:fs";
 
 await esbuild.build({
-  entryPoints: ["src/index.ts"],
+  entryPoints: ["src/cli/index.ts"],
   bundle: true,
   platform: "node",
   // package.json declares "type": "module", so dist/index.js is loaded as ESM.
