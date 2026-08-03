@@ -117,6 +117,24 @@ export async function runTurn(ctx: SessionContext, command: CommandRecord): Prom
         if (ctx.currentTurn) await release(ctx, ctx.currentTurn.activeSeq);
       }
       const mapped = ctx.mapMessage(message);
+      // A turn's own end and a mid-turn compaction are the only two moments
+      // the context window's fill level actually changes, so those are the
+      // only points this is refreshed. Best-effort: never let a stat fail
+      // the turn it is reporting on.
+      if (
+        (message.type === "result" && message.subtype === "success") ||
+        (message.type === "system" && message.subtype === "compact_boundary")
+      ) {
+        try {
+          const { percentage } = await activeQuery.getContextUsage();
+          const target = mapped.find(
+            (evt) => evt.type === "turn_complete" || evt.type === "status",
+          );
+          if (target) target.context_percentage = Math.round(percentage);
+        } catch (e) {
+          console.error("Failed to get context usage:", (e as Error).message);
+        }
+      }
       if (steered) {
         for (const evt of mapped) {
           if (evt.type === "turn_complete") evt.no_notify = true;

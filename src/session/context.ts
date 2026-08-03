@@ -90,6 +90,7 @@ export interface SessionContext {
     | {
         stopTask(taskId: string): Promise<void>;
         streamInput(stream: AsyncIterable<SDKUserMessage>): Promise<void>;
+        getContextUsage(): Promise<{ percentage: number }>;
       }
     | undefined;
 

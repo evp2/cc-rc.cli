@@ -61,6 +61,8 @@ export interface EventInput {
   tasks?: BackgroundTaskRow[];
   /** On a `turn_complete` for a Turn that accepted a Steer -- tells the relay to skip the Web Push. */
   no_notify?: boolean;
+  /** Rounded percent of the model's context window in use, on `turn_complete` and the compact-boundary `status` event. Omitted when the SDK's `getContextUsage()` call failed. */
+  context_percentage?: number;
 }
 
 export interface CreateSessionInput {

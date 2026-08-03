@@ -30,6 +30,9 @@ import { AsyncQueue, takeOne, textOf } from "./asyncQueue";
 
 const FAKE_SESSION_ID = "fake-sdk-session";
 
+/** What every fake persona's `getContextUsage()` reports. */
+const FAKE_CONTEXT_PERCENTAGE = 42;
+
 function systemInit(): SDKMessage {
   return {
     type: "system",
@@ -112,7 +115,10 @@ function resultSuccess(): SDKMessage {
     num_turns: 1,
     result: "ok",
     stop_reason: null,
-    total_cost_usd: 0.0001,
+    // 0.01 rather than 0.0001: the client's divider now shows cost_usd to only
+    // 2 decimals, and 0.0001 rounds to "$0.00" there, which made
+    // smoke.spec.ts's telemetry.costUsd > 0 assertion fail.
+    total_cost_usd: 0.01,
     usage: {},
     modelUsage: {},
     permission_denials: [],
@@ -650,6 +656,9 @@ function buildQuery(
     streamInput: async (stream: AsyncIterable<SDKUserMessage>): Promise<void> => {
       for await (const message of stream) mailbox.push(message);
     },
+    // Fixed rather than persona-specific: no scripted turn currently needs a
+    // particular reading, only that one is available for the phone to render.
+    getContextUsage: async () => ({ percentage: FAKE_CONTEXT_PERCENTAGE }),
   };
   return q as unknown as Query;
 }
