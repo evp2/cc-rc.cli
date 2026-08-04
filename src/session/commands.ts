@@ -34,7 +34,7 @@ function inFlightSnapshot(ctx: SessionContext): ConnectorState["inFlight"] {
 }
 
 /** Best-effort: a failed report leaves the phone's brake stale until the next successful one, not broken. */
-async function reportInFlight(ctx: SessionContext, inFlight: boolean): Promise<void> {
+export async function reportInFlight(ctx: SessionContext, inFlight: boolean): Promise<void> {
   try {
     await ctx.client.setInFlight(inFlight);
   } catch (e) {

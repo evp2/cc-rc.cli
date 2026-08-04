@@ -4,7 +4,7 @@ import { createSdkMessageMapper } from "../sdk/bridge";
 import { RelayClient, SessionEndedError } from "../relay/client";
 import { probeSkills } from "../skills";
 import { readState, type ConnectorState } from "../state";
-import { claim, persist, promoteToRunning, publishSkills } from "./commands";
+import { claim, persist, promoteToRunning, publishSkills, reportInFlight } from "./commands";
 import type { SessionContext } from "./context";
 import { flushEvents } from "./events";
 import { runTurn } from "./turn";
@@ -153,6 +153,13 @@ export async function runConnector(config: ConnectorConfig): Promise<RunHandle> 
       });
     }
     persist(ctx, { inFlight: undefined });
+    // The relay still has whatever in_flight the dead process last reported
+    // -- true, if it died mid-turn. Nothing else will ever correct that: a
+    // fresh process starts with an empty inFlightEntries, so claim()'s own
+    // wasEmpty check will not fire again until a *new* Command arrives, and
+    // until one does (and completes), the phone's brake and Thinking
+    // indicator would otherwise be stuck true indefinitely.
+    await reportInFlight(ctx, false);
   }
 
   // Background tasks left running when a previous process died are gone with it
