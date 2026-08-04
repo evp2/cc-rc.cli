@@ -12,6 +12,9 @@ import { watchForKills, watchForSteers } from "./watchers";
 
 const POLL_INTERVAL_MS = 1750;
 const FLUSH_INTERVAL_MS = 750;
+// Roughly the phone's own status-poll cadence, so a corrected value is never
+// more than about one of the phone's own polls late.
+const INFLIGHT_RECONCILE_INTERVAL_MS = 5000;
 
 export interface RunHandle {
   phoneUrl: string;
@@ -190,6 +193,15 @@ export async function runConnector(config: ConnectorConfig): Promise<RunHandle> 
   const flushTimer = setInterval(() => {
     void flushEvents(ctx);
   }, FLUSH_INTERVAL_MS);
+  // reportInFlight (see commands.ts) is best-effort: a lost or failed PUT
+  // otherwise strands the relay's belief until the next claim()/release()
+  // transition, which may not come for a long time (or ever, if nothing new
+  // is sent). This periodically re-asserts the connector's own current truth
+  // regardless of whether anything changed, so a stranded flag self-heals
+  // within one interval instead of staying wrong indefinitely.
+  const inFlightReconcileTimer = setInterval(() => {
+    void reportInFlight(ctx, ctx.inFlightEntries.size > 0);
+  }, INFLIGHT_RECONCILE_INTERVAL_MS);
   const stopWatchingKills = watchForKills(ctx);
   const stopWatchingSteers = watchForSteers(ctx);
 
@@ -210,6 +222,7 @@ export async function runConnector(config: ConnectorConfig): Promise<RunHandle> 
     shuttingDown = true;
     ctx.running = false;
     clearInterval(flushTimer);
+    clearInterval(inFlightReconcileTimer);
     stopWatchingKills();
     stopWatchingSteers();
     if (!ctx.sessionEnded) await flushEvents(ctx).catch(() => undefined);
