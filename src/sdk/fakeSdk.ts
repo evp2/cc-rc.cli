@@ -440,6 +440,39 @@ async function* steeringPersona(
   yield* subTurnLoop(options, mailbox);
 }
 
+/**
+ * Takes a Steer and then ends the query without ever confirming it with a
+ * fresh `system:init` -- the shape every other steering persona is careful
+ * never to produce, and the one the real SDK produces routinely.
+ *
+ * A Local command (`/compact`) streamed in mid-Turn is the guaranteed case:
+ * the CLI handles it itself and reports a `compact_boundary` and a `result`,
+ * never a fresh `init`, so the Steer the connector is holding is never
+ * confirmed and the query simply ends. A `streamInput` that rejects reaches
+ * the same state by a different road.
+ */
+async function* steeringNoConfirmPersona(
+  options: Options,
+  mailbox: AsyncQueue<SDKUserMessage>,
+): AsyncGenerator<SDKMessage, void> {
+  yield systemInit();
+  const signal = options.abortController?.signal;
+  for (let step = 1; step <= FIRST_SUBTURN_STEPS; step++) {
+    const toolUseId = `toolu_${randomUUID()}`;
+    yield assistantToolUse(toolUseId, "Bash", { command: `echo step-${step}` });
+    yield userToolResult(toolUseId, `step-${step}`);
+    const outcome = await pauseForSteer(mailbox, signal);
+    if (outcome.kind === "abort") return;
+    if (outcome.kind === "steer") {
+      yield assistantText("absorbed the steer without starting a new sub-turn");
+      yield resultSuccess();
+      return;
+    }
+  }
+  yield assistantText("finished without being steered further");
+  yield resultSuccess();
+}
+
 /** Like {@link steeringPersona}, but see `confirmDelayMs` on {@link subTurnLoop}. */
 async function* steeringSlowConfirmPersona(
   options: Options,
@@ -599,6 +632,8 @@ function dispatch(
       return steeringWithQuestionPersona(options, mailbox);
     case "steering-slow-confirm":
       return steeringSlowConfirmPersona(options, mailbox);
+    case "steering-no-confirm":
+      return steeringNoConfirmPersona(options, mailbox);
     default:
       throw new Error(`Unknown CRC_FAKE_SDK persona: '${persona}'`);
   }
@@ -624,6 +659,7 @@ const FAKE_SUPPORTED_COMMANDS: Record<string, SlashCommand[]> = {
   steering: [],
   "steering-with-question": [],
   "steering-slow-confirm": [],
+  "steering-no-confirm": [],
 };
 
 function sleep(ms: number): Promise<void> {

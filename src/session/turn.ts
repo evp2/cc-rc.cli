@@ -181,15 +181,27 @@ export async function runTurn(ctx: SessionContext, command: CommandRecord): Prom
       }
     }
     if (ctx.currentTurn) {
-      // A Steer streamed in but never confirmed by a fresh `init` before
-      // this query ended. Stop ending the query is the only case this
-      // reports right now: the brake starting fresh work is not a brake, so
-      // it must not be left to run and cannot wait for a restart that isn't
-      // coming. Any other unconfirmed case (a genuine crash) is instead
-      // left in the in-flight set for the next start to report -- it is
-      // still there, `queued`, since nothing here removes it.
-      if (ctx.currentTurn.pendingSteerSeq && abortController.signal.aborted) {
-        await discard(ctx, ctx.currentTurn.pendingSteerSeq);
+      // A Steer streamed in but never confirmed by a fresh `init` before this
+      // query ended -- which is ordinary, not exceptional: a Local command
+      // (`/compact`) streamed into a running Turn is answered by the CLI
+      // itself, which reports a compact_boundary and a result and then ends
+      // the query, never a fresh `init`. Under Stop it is discarded, visibly:
+      // the brake starting fresh work is not a brake. Otherwise it reached
+      // the SDK and was absorbed into the Turn that just ended, so it is
+      // simply done and the claim has to go.
+      //
+      // Leaving it for a restart to report is not an option either way. This
+      // block only runs because the process is alive; a genuine crash skips
+      // it entirely and the state file still carries the entry for the next
+      // start. Held here, it would sit in the in-flight set for the life of
+      // the process, with the reconcile timer re-asserting in_flight true
+      // every few seconds against a session that finished long ago.
+      if (ctx.currentTurn.pendingSteerSeq) {
+        if (abortController.signal.aborted) {
+          await discard(ctx, ctx.currentTurn.pendingSteerSeq);
+        } else {
+          await release(ctx, ctx.currentTurn.pendingSteerSeq);
+        }
       }
       // Idempotent: already released by the `result` handling above in the
       // ordinary case, so this only does anything for an abort or an

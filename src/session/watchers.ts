@@ -97,7 +97,14 @@ export function watchForSteers(ctx: SessionContext): () => void {
           try {
             await ctx.currentQuery.streamInput(steerInput);
           } catch (e) {
+            // It never reached the query, so no `init` is ever coming to
+            // confirm it and no Turn will ever end holding it. Said out loud
+            // and released here rather than left claimed: a Command that
+            // silently neither runs nor comes back is worse than one the
+            // human can see didn't make it and send again.
             console.error("Failed to stream a Steer into the turn:", (e as Error).message);
+            turn.pendingSteerSeq = undefined;
+            await discard(ctx, first.seq);
           }
         }
       } else {
