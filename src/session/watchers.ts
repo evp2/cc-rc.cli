@@ -2,7 +2,6 @@ import type { CanUseTool, PermissionResult, SDKUserMessage } from "@anthropic-ai
 
 import { AsyncQueue, userTextMessage } from "../sdk/asyncQueue";
 import { SessionEndedError, type CommandRecord } from "../relay/client";
-import { claim, discard } from "./commands";
 import type { SessionContext } from "./context";
 
 // How often a running turn checks whether the phone has asked it to stop.
@@ -57,14 +56,15 @@ export function watchForKills(ctx: SessionContext): () => void {
 export function watchForSteers(ctx: SessionContext): () => void {
   const timer = setInterval(() => {
     void (async () => {
+      const held = ctx.inFlight.current();
       const turn = ctx.currentTurn;
-      if (!turn || !ctx.currentQuery) return;
+      if (!held || !turn || !ctx.currentQuery) return;
       if (turn.abortController.signal.aborted) return;
       if (ctx.questionPending) return;
 
       let commands: CommandRecord[];
       try {
-        commands = await ctx.client.pollCommands(ctx.since);
+        commands = await ctx.client.pollCommands(ctx.inFlight.cursor);
       } catch (e) {
         if (!(e instanceof SessionEndedError)) {
           console.error("Steer poll failed:", (e as Error).message);
@@ -73,23 +73,26 @@ export function watchForSteers(ctx: SessionContext): () => void {
       }
       if (commands.length === 0) return;
       // Stop or a Question can have landed while that poll was in flight --
-      // re-check against the same turn this tick started for, not fresh
-      // globals, so a stale response from a query started under a Turn that
-      // has since ended can never mis-claim anything.
-      if (ctx.currentTurn !== turn || turn.abortController.signal.aborted || ctx.questionPending) {
+      // re-check against the same claims handle this tick started for, not
+      // fresh globals. The handle is the Turn's identity, so a stale response
+      // from a poll started under a Turn that has since ended can never
+      // mis-claim anything.
+      if (
+        ctx.inFlight.current() !== held ||
+        turn.abortController.signal.aborted ||
+        ctx.questionPending
+      ) {
         return;
       }
 
       const [first, ...rest] = commands;
       if (!turn.steeredThisSubTurn) {
         turn.steeredThisSubTurn = true;
-        turn.pendingSteerSeq = first.seq;
-        await claim(ctx, first, "queued");
+        await held.steer(first);
         if (turn.abortController.signal.aborted) {
           // Stop landed in the gap between claiming and streaming it in --
           // discard rather than deliver into a query that is already ending.
-          turn.pendingSteerSeq = undefined;
-          await discard(ctx, first.seq);
+          await held.abandonSteer();
         } else {
           const steerInput = new AsyncQueue<SDKUserMessage>();
           steerInput.push(userTextMessage(first.text, { priority: "now" }));
@@ -103,16 +106,15 @@ export function watchForSteers(ctx: SessionContext): () => void {
             // silently neither runs nor comes back is worse than one the
             // human can see didn't make it and send again.
             console.error("Failed to stream a Steer into the turn:", (e as Error).message);
-            turn.pendingSteerSeq = undefined;
-            await discard(ctx, first.seq);
+            await held.abandonSteer();
           }
         }
       } else {
-        await claim(ctx, first, "queued");
+        await ctx.inFlight.hold(first, "queued");
         ctx.handBackBuffer.push(first);
       }
       for (const extra of rest) {
-        await claim(ctx, extra, "queued");
+        await ctx.inFlight.hold(extra, "queued");
         ctx.handBackBuffer.push(extra);
       }
     })();

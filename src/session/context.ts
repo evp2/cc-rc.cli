@@ -1,19 +1,24 @@
-import type { SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
+import type { query as realQuery, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 
 import type { ConnectorConfig } from "../config";
 import type { createSdkMessageMapper } from "../sdk/bridge";
 import type { CommandRecord, EventInput, RelayClient } from "../relay/client";
+import type { InFlight } from "./inFlight";
 import type { ConnectorState } from "../state";
 
-/** The Turn currently executing, if any -- shared between {@link runTurn} in turn.ts and {@link watchForSteers} in watchers.ts. */
+/**
+ * The Turn currently executing, if any -- shared between {@link runTurn} in
+ * turn.ts and {@link watchForSteers} in watchers.ts.
+ *
+ * Carries only what is not a claim. Which Commands the Turn holds, and which
+ * of them a Steer is waiting on, live on the handle {@link InFlight.current}
+ * returns: they used to be duplicated here and in the held set, and the two
+ * copies drifting is what left a Steer claimed forever.
+ */
 export interface CurrentTurn {
   abortController: AbortController;
-  /** The Command whose entry in {@link SessionContext.inFlightEntries} is `running` right now. */
-  activeSeq: string;
   /** Whether this specific sub-turn has already taken its one allowed Steer. */
   steeredThisSubTurn: boolean;
-  /** Set the instant a Steer is streamed in, cleared once its fresh `system:init` confirms it landed. */
-  pendingSteerSeq?: string;
 }
 
 /**
@@ -29,17 +34,26 @@ export interface SessionContext {
   readonly providerEnv: NodeJS.ProcessEnv;
   readonly mapMessage: ReturnType<typeof createSdkMessageMapper>;
 
+  /**
+   * The connector's door into the SDK's `query()`, defaulted from sdk/client.ts
+   * so production and the e2e harness are unaffected. A field rather than a
+   * direct import because that module picks its adapter once, from a process
+   * environment variable -- a real seam, but one placed at process scope, which
+   * is why driving a Turn used to require a whole connector process. Passed
+   * here, a test can hand a Turn a scripted message sequence in-process.
+   */
+  readonly query: typeof realQuery;
+
+  /** How durable state reaches disk. A field for the same reason `query` is: the real one resolves a path under the user's home directory, which a test must not write to. */
+  readonly writeState: (state: ConnectorState) => void;
+
+  /** The authoritative record of every Command held but not finished, and the command-log cursor that moves with it. */
+  readonly inFlight: InFlight;
+
   state: ConnectorState;
   /** Last-published skill+local-command lists, as JSON, so a turn whose lists haven't changed since the last publish (the common case) doesn't PUT anything. */
   lastSkillsJson: string | undefined;
   sdkSessionId: string | undefined;
-  /**
-   * The shared command-log cursor: the main loop's own poll and the
-   * turn-scoped {@link watchForSteers} poll both read and advance this same
-   * field, since claiming a Command -- whichever of the two claims it --
-   * must never be re-read by the other.
-   */
-  since: string | undefined;
   eventBuffer: EventInput[];
   running: boolean;
   /** Set once the relay reports the session gone; suppresses further posting. */
@@ -55,13 +69,6 @@ export interface SessionContext {
    * request isn't re-sent to the SDK on every poll.
    */
   lastHandledKillAt: string | undefined;
-
-  /**
-   * Every Command the connector currently holds but has not finished, keyed
-   * by seq -- the source of both the relay-facing in-flight fact and the
-   * state file's crash-honesty record.
-   */
-  readonly inFlightEntries: Map<string, { seq: string; text: string; status: "running" | "queued" }>;
 
   /**
    * In-memory only, by design: a Command the current Turn was too late to

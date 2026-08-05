@@ -3,10 +3,12 @@ import { buildProviderEnv } from "../provider";
 import { createSdkMessageMapper } from "../sdk/bridge";
 import { RelayClient, SessionEndedError } from "../relay/client";
 import { probeSkills } from "../skills";
-import { readState, type ConnectorState } from "../state";
-import { claim, persist, promoteToRunning, publishSkills, reportInFlight } from "./commands";
+import { readState, writeState, type ConnectorState } from "../state";
+import { query } from "../sdk/client";
+import { persist, publishSkills } from "./commands";
 import type { SessionContext } from "./context";
 import { flushEvents } from "./events";
+import { InFlight } from "./inFlight";
 import { runTurn } from "./turn";
 import { watchForKills, watchForSteers } from "./watchers";
 
@@ -82,10 +84,30 @@ export async function runConnector(config: ConnectorConfig): Promise<RunHandle> 
   const providerEnv = buildProviderEnv(config.provider);
   const { client, phoneUrl, resumed } = await acquireSession(config);
 
-  const ctx: SessionContext = {
+  // Declared before the context so the ledger's dependencies can close over
+  // it: the ledger persists and emits through the same paths everything else
+  // does, and the context in turn holds the ledger.
+  let ctx: SessionContext;
+  const inFlight = new InFlight(
+    {
+      setInFlight: (value) => client.setInFlight(value),
+      persist: (patch) => persist(ctx, patch),
+      emit: (event) => {
+        ctx.eventBuffer.push(event);
+      },
+      log: (message) => console.log(message),
+      error: (message) => console.error(message),
+    },
+    { cursor: resumed?.commandCursor },
+  );
+
+  ctx = {
     client,
     config,
     providerEnv,
+    query,
+    writeState,
+    inFlight,
     // One mapper for the whole process: it remembers the session banner
     // across turns so it is announced once, not above every reply.
     mapMessage: createSdkMessageMapper(),
@@ -105,13 +127,11 @@ export async function runConnector(config: ConnectorConfig): Promise<RunHandle> 
     },
     lastSkillsJson: undefined,
     sdkSessionId: resumed?.sdkSessionId,
-    since: resumed?.commandCursor,
     eventBuffer: [],
     running: true,
     sessionEnded: false,
     runningTasks: [],
     lastHandledKillAt: undefined,
-    inFlightEntries: new Map(),
     handBackBuffer: [],
     questionPending: false,
     currentTurn: undefined,
@@ -135,35 +155,9 @@ export async function runConnector(config: ConnectorConfig): Promise<RunHandle> 
     }
   })();
 
-  // Every Command recorded as in flight by a previous process never
-  // completed -- the connector died holding it. Cursors for all of them were
-  // already advanced, so none will be re-run; say so rather than letting them
-  // vanish silently. A `running` entry was genuinely cut off mid-turn; a
-  // `queued` one (a Steer that had been claimed, or hand-back work) never
-  // started at all, so calling it "interrupted" would say something false.
-  if (resumed?.inFlight?.length) {
-    for (const entry of resumed.inFlight) {
-      console.log(`Reporting ${entry.status} command dropped by restart: ${entry.seq}`);
-      ctx.eventBuffer.push({
-        type: "error",
-        text:
-          entry.status === "running"
-            ? "The previous turn was interrupted when the connector stopped, and will " +
-              "not be re-run automatically. Send it again if you still want it."
-            : "A queued command was dropped when the connector stopped before it ran. " +
-              "Send it again if you still want it.",
-        is_error: true,
-      });
-    }
-    persist(ctx, { inFlight: undefined });
-    // The relay still has whatever in_flight the dead process last reported
-    // -- true, if it died mid-turn. Nothing else will ever correct that: a
-    // fresh process starts with an empty inFlightEntries, so claim()'s own
-    // wasEmpty check will not fire again until a *new* Command arrives, and
-    // until one does (and completes), the phone's brake and Thinking
-    // indicator would otherwise be stuck true indefinitely.
-    await reportInFlight(ctx, false);
-  }
+  // Explains, and corrects the relay for, whatever a previous process died
+  // holding.
+  await inFlight.resumeFrom(resumed?.inFlight);
 
   // Background tasks left running when a previous process died are gone with it
   // -- the CLI subprocess they were children of no longer exists. Report each
@@ -193,14 +187,10 @@ export async function runConnector(config: ConnectorConfig): Promise<RunHandle> 
   const flushTimer = setInterval(() => {
     void flushEvents(ctx);
   }, FLUSH_INTERVAL_MS);
-  // reportInFlight (see commands.ts) is best-effort: a lost or failed PUT
-  // otherwise strands the relay's belief until the next claim()/release()
-  // transition, which may not come for a long time (or ever, if nothing new
-  // is sent). This periodically re-asserts the connector's own current truth
-  // regardless of whether anything changed, so a stranded flag self-heals
-  // within one interval instead of staying wrong indefinitely.
+  // The interval lives here rather than inside the ledger, so the ledger stays
+  // drivable from a test without fake timers.
   const inFlightReconcileTimer = setInterval(() => {
-    void reportInFlight(ctx, ctx.inFlightEntries.size > 0);
+    void inFlight.reconcileOnce();
   }, INFLIGHT_RECONCILE_INTERVAL_MS);
   const stopWatchingKills = watchForKills(ctx);
   const stopWatchingSteers = watchForSteers(ctx);
@@ -243,14 +233,13 @@ export async function runConnector(config: ConnectorConfig): Promise<RunHandle> 
       // polled again, so it is never rewound, re-fetched, or dropped.
       while (ctx.handBackBuffer.length > 0 && ctx.running) {
         const command = ctx.handBackBuffer.shift()!;
-        promoteToRunning(ctx, command.seq);
         await runTurn(ctx, command);
       }
       if (!ctx.running) break;
 
       let commands;
       try {
-        commands = await client.pollCommands(ctx.since);
+        commands = await client.pollCommands(inFlight.cursor);
       } catch (e) {
         if (e instanceof SessionEndedError) break;
         console.error("Poll failed, retrying:", (e as Error).message);
@@ -260,10 +249,10 @@ export async function runConnector(config: ConnectorConfig): Promise<RunHandle> 
 
       for (const command of commands) {
         if (!ctx.running) break;
-        // The cursor advances *before* the turn runs, so a connector that dies
-        // mid-turn never re-runs it against a tree it has already half-changed.
-        // `inFlight` is what lets the next start report that it was dropped.
-        await claim(ctx, command, "running");
+        // runTurn claims through the ledger on the way in, so the cursor
+        // advances *before* the turn runs: a connector that dies mid-turn
+        // never re-runs it against a tree it has already half-changed, and the
+        // held record is what lets the next start report that it was dropped.
         await runTurn(ctx, command);
       }
 
