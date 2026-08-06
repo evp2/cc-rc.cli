@@ -20,6 +20,7 @@ const INFLIGHT_RECONCILE_INTERVAL_MS = 5000;
 
 export interface RunHandle {
   phoneUrl: string;
+  netlifyUrl: string | undefined;
   sessionId: string;
   /** False when the session was newly minted, so callers can say which it was. */
   resumed: boolean;
@@ -36,9 +37,12 @@ export interface RunHandle {
  * than trusted -- a config edit should not silently reattach the connector to a
  * session created under the old settings.
  */
-async function acquireSession(
-  config: ConnectorConfig,
-): Promise<{ client: RelayClient; phoneUrl: string; resumed: ConnectorState | undefined }> {
+async function acquireSession(config: ConnectorConfig): Promise<{
+  client: RelayClient;
+  phoneUrl: string;
+  netlifyUrl: string | undefined;
+  resumed: ConnectorState | undefined;
+}> {
   const previous = readState(config.projectDir);
   const reusable =
     previous &&
@@ -53,14 +57,19 @@ async function acquireSession(
         previous.secret,
       );
       console.log(`Resumed session ${client.sessionId}`);
-      return { client, phoneUrl: previous.phoneUrl || client.phoneUrl(), resumed: previous };
+      return {
+        client,
+        phoneUrl: previous.phoneUrl || client.phoneUrl(),
+        netlifyUrl: previous.netlifyUrl,
+        resumed: previous,
+      };
     } catch (e) {
       if (!(e instanceof SessionEndedError)) throw e;
       console.log("Previous session has ended; starting a new one.");
     }
   }
 
-  const { client, phoneUrl } = await RelayClient.create(
+  const { client, phoneUrl, netlifyUrl } = await RelayClient.create(
     config.relayBaseUrl,
     config.createSecret,
     {
@@ -73,7 +82,7 @@ async function acquireSession(
   );
   // Rotating discards the conversation along with the session, so a blank
   // transcript on the phone always means a genuinely fresh Claude.
-  return { client, phoneUrl, resumed: undefined };
+  return { client, phoneUrl, netlifyUrl, resumed: undefined };
 }
 
 /**
@@ -82,7 +91,7 @@ async function acquireSession(
  */
 export async function runConnector(config: ConnectorConfig): Promise<RunHandle> {
   const providerEnv = buildProviderEnv(config.provider);
-  const { client, phoneUrl, resumed } = await acquireSession(config);
+  const { client, phoneUrl, netlifyUrl, resumed } = await acquireSession(config);
 
   // Declared before the context so the ledger's dependencies can close over
   // it: the ledger persists and emits through the same paths everything else
@@ -118,6 +127,7 @@ export async function runConnector(config: ConnectorConfig): Promise<RunHandle> 
       sessionId: client.sessionId,
       secret: client.sessionSecret,
       phoneUrl,
+      netlifyUrl,
       commandCursor: resumed?.commandCursor,
       sdkSessionId: resumed?.sdkSessionId,
       inFlight: undefined,
@@ -261,7 +271,7 @@ export async function runConnector(config: ConnectorConfig): Promise<RunHandle> 
     await shutdown();
   })();
 
-  return { phoneUrl, sessionId: client.sessionId, resumed: resumed !== undefined, done };
+  return { phoneUrl, netlifyUrl, sessionId: client.sessionId, resumed: resumed !== undefined, done };
 }
 
 function sleep(ms: number): Promise<void> {

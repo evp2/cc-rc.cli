@@ -19,6 +19,11 @@ import {
 const START_TIMEOUT_MS = 45_000;
 const START_POLL_MS = 250;
 
+/** Prints the share link, if this relay minted one -- absent against an older deployment. */
+function printShareUrl(netlifyUrl: string | undefined): void {
+  if (netlifyUrl) console.log(`Share (full access, no secret needed):\n  ${netlifyUrl}\n`);
+}
+
 export async function runForeground(config: ConnectorConfig): Promise<void> {
   const existing = liveConnector(config.projectDir);
   if (existing && existing.pid !== process.pid) {
@@ -34,6 +39,7 @@ export async function runForeground(config: ConnectorConfig): Promise<void> {
   );
   console.log(`Open on your phone:\n  ${handle.phoneUrl}\n`);
   printPairingQrCode(handle.phoneUrl);
+  printShareUrl(handle.netlifyUrl);
   console.log("");
   await handle.done;
 }
@@ -51,6 +57,7 @@ export async function start(config: ConnectorConfig, configPath: string): Promis
     console.log(`Already running for ${config.projectDir} (pid ${existing.pid}).`);
     console.log(`Open on your phone:\n  ${existing.phoneUrl}\n`);
     printPairingQrCode(existing.phoneUrl);
+    printShareUrl(existing.netlifyUrl);
     return;
   }
 
@@ -86,6 +93,7 @@ export async function start(config: ConnectorConfig, configPath: string): Promis
       console.log(`Logging to ${log}`);
       console.log(`Open on your phone:\n  ${state.phoneUrl}\n`);
       printPairingQrCode(state.phoneUrl);
+      printShareUrl(state.netlifyUrl);
       return;
     }
     if (child.pid && !isProcessAlive(child.pid)) break;
@@ -191,6 +199,7 @@ export async function status(config: ConnectorConfig): Promise<void> {
       }`,
     );
     console.log(`phone url     ${state.phoneUrl}`);
+    if (state.netlifyUrl) console.log(`share url     ${state.netlifyUrl}`);
   } catch (e) {
     if (e instanceof SessionEndedError) {
       console.log(`session       ${state.sessionId} (ended -- next start rotates, phone must re-pair)`);
@@ -238,6 +247,7 @@ export async function qr(config: ConnectorConfig): Promise<void> {
   }
   console.log(`Open on your phone:\n  ${state.phoneUrl}\n`);
   printPairingQrCode(state.phoneUrl);
+  printShareUrl(state.netlifyUrl);
 }
 
 function tailLog(path: string, lines: number): string {

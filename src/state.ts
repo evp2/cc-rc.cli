@@ -30,6 +30,8 @@ export interface ConnectorState {
   sessionId: string;
   secret: string;
   phoneUrl: string;
+  /** The Netlify share link for this session, if the relay minted one -- full access, no secret. */
+  netlifyUrl?: string;
   /**
    * Seq of the most recent command *claimed*, written before the turn runs
    * rather than after it succeeds. A command at or below this is never executed

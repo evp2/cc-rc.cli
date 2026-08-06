@@ -105,7 +105,7 @@ export class RelayClient {
     relayBaseUrl: string,
     createSecret: string,
     input: CreateSessionInput,
-  ): Promise<{ client: RelayClient; phoneUrl: string }> {
+  ): Promise<{ client: RelayClient; phoneUrl: string; netlifyUrl: string | undefined }> {
     const res = await fetch(`${relayBaseUrl}/sessions`, {
       method: "POST",
       headers: {
@@ -127,10 +127,13 @@ export class RelayClient {
       session_id: string;
       secret: string;
       phone_url: string;
+      // Absent against an older relay deployment that predates this field.
+      netlify_url?: string;
     };
     return {
       client: new RelayClient(relayBaseUrl, body.session_id, body.secret),
       phoneUrl: body.phone_url,
+      netlifyUrl: body.netlify_url,
     };
   }
 
