@@ -182,3 +182,8 @@ connector warns about it at startup.
 4. Streamed SDK messages are mapped to a compact JSON event schema and
    batch-flushed to `POST /sessions/{id}/events` every ~750 ms for the phone
    to poll and render.
+5. A turn that committed code reports its line counts to
+   `POST /sessions/{id}/contributions`, attributed to `origin`. Measured by
+   diffing the commit the turn started on against the one it ended on, and
+   skipped entirely when the branch moved sideways or the directory is not a
+   git repository. Turns that commit nothing send nothing.

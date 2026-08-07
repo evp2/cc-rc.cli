@@ -310,6 +310,35 @@ export class RelayClient {
     }
   }
 
+  /**
+   * Reports what one Turn committed. Called only for a Turn that committed
+   * something, and nothing is buffered behind it: a report that fails is
+   * simply lost, deliberately. In-memory state that never reaches the relay
+   * is the failure mode behind both production bugs this connector has had,
+   * and a line count is not worth reintroducing it for.
+   *
+   * Throws {@link SessionEndedError} once the relay reports the session gone.
+   */
+  async postContribution(input: {
+    host?: string;
+    repo?: string;
+    added: number;
+    deleted: number;
+  }): Promise<void> {
+    const res = await this.fetch(
+      `${this.relayBaseUrl}/sessions/${this.sessionId}/contributions`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json", ...this.authHeaders() },
+        body: JSON.stringify(input),
+      },
+    );
+    await checkTerminal(res);
+    if (!res.ok) {
+      throw new Error(`postContribution failed: HTTP ${res.status} ${await res.text()}`);
+    }
+  }
+
   /** Best-effort -- called during shutdown, failures are not actionable. */
   async end(): Promise<void> {
     await this.fetch(`${this.relayBaseUrl}/sessions/${this.sessionId}/end`, {

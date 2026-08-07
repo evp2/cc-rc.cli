@@ -1,4 +1,8 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 
 import { runTurn } from "../src/session/turn.ts";
@@ -174,4 +178,48 @@ test("a Turn claimed from the hand-back buffer is promoted, not re-claimed", asy
   assert.equal(h.ledger.snapshot(), undefined);
   assert.equal(h.ledger.cursor, queued.seq, "the cursor did not advance twice");
   assert.deepEqual(h.relay.reports, [true, false]);
+});
+
+/** A repository the Turn below can commit into, so the report is measured from real history. */
+function makeRepo(origin?: string): string {
+  const dir = mkdtempSync(join(tmpdir(), "crc-turn-repo-"));
+  const run = (...args: string[]) =>
+    execFileSync("git", args, { cwd: dir, encoding: "utf-8" });
+  run("init", "-q", "-b", "main");
+  run("config", "user.email", "test@example.invalid");
+  run("config", "user.name", "Test");
+  if (origin) run("remote", "add", "origin", origin);
+  writeFileSync(join(dir, "README.md"), "start\n");
+  run("add", "-A");
+  run("commit", "-q", "-m", "initial");
+  return dir;
+}
+
+test("a Turn that committed reports it once, attributed to the repo", async () => {
+  const dir = makeRepo("git@github.com:acme/widgets.git");
+  const h = makeTurnHarness([init(), assistantText("committing"), result()], {
+    projectDir: dir,
+    onYield: async (message) => {
+      if (message.type !== "result") return;
+      writeFileSync(join(dir, "feature.ts"), "one\ntwo\n");
+      execFileSync("git", ["add", "-A"], { cwd: dir });
+      execFileSync("git", ["commit", "-q", "-m", "feature"], { cwd: dir });
+    },
+  });
+
+  await runTurn(h.ctx, cmd("build the feature"));
+
+  assert.deepEqual(h.relay.contributions, [
+    { host: "github.com", repo: "acme/widgets", added: 2, deleted: 0 },
+  ]);
+});
+
+test("a Turn that committed nothing reports nothing", async () => {
+  const h = makeTurnHarness([init(), assistantText("just talking"), result()], {
+    projectDir: makeRepo(),
+  });
+
+  await runTurn(h.ctx, cmd("what does this do?"));
+
+  assert.deepEqual(h.relay.contributions, []);
 });

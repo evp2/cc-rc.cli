@@ -2,8 +2,9 @@ import type { Options, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 
 import { AsyncQueue, userTextMessage } from "../sdk/asyncQueue";
 import { PERMISSION_MODE } from "../config";
-import type { CommandRecord } from "../relay/client";
+import { SessionEndedError, type CommandRecord } from "../relay/client";
 import { persist, publishSkills, trackBackgroundTasks } from "./commands";
+import { measureContribution, readPosition, type Position } from "./contribution";
 import type { SessionContext } from "./context";
 import { checkInterrupt, makeCanUseTool, watchForInterrupt } from "./watchers";
 import { selectLocalCommands, selectSkills } from "../skills";
@@ -46,6 +47,11 @@ export async function runTurn(ctx: SessionContext, command: CommandRecord): Prom
     canUseTool,
     ...(ctx.sdkSessionId ? { resume: ctx.sdkSessionId } : {}),
   };
+
+  // Read before any of the Turn's work starts, so the range below spans
+  // everything it committed -- including a Steer's sub-turns, which are part
+  // of the same Turn chain and the same piece of work.
+  const positionBefore = await readPosition(ctx.config.projectDir);
 
   await ctx.inFlight.duringTurn(command, abortController.signal, async (claims) => {
     // A stop counts if it was issued after the command it targets -- not after
@@ -186,4 +192,30 @@ export async function runTurn(ctx: SessionContext, command: CommandRecord): Prom
       ctx.currentTurn = undefined;
     }
   });
+
+  await reportContribution(ctx, positionBefore);
+}
+
+/**
+ * Tells the relay what this Turn committed, if anything. Runs after the
+ * in-flight scope has closed, so a slow git or a slow relay cannot hold the
+ * phone's brake on past the work it describes.
+ *
+ * Best-effort in every direction: a Turn that committed nothing reports
+ * nothing, and a report that fails is dropped rather than retried or
+ * remembered. A Turn stopped part-way still reports -- the commits it made
+ * before the brake are as real as any others.
+ */
+async function reportContribution(
+  ctx: SessionContext,
+  positionBefore: Position | undefined,
+): Promise<void> {
+  try {
+    const contribution = await measureContribution(ctx.config.projectDir, positionBefore);
+    if (!contribution) return;
+    await ctx.client.postContribution(contribution);
+  } catch (e) {
+    if (e instanceof SessionEndedError) return;
+    console.error("Failed to report contribution:", (e as Error).message);
+  }
 }

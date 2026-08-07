@@ -11,6 +11,8 @@ import type { ConnectorState } from "../src/state.ts";
 export class FakeRelay {
   readonly reports: boolean[] = [];
   readonly posted: EventInput[] = [];
+  /** Every contribution reported, so a test can assert a Turn reported once, or not at all. */
+  readonly contributions: { host?: string; repo?: string; added: number; deleted: number }[] = [];
   /** Set to make the next setInFlight reject, for the best-effort path. */
   failNextReport: Error | undefined;
 
@@ -35,6 +37,15 @@ export class FakeRelay {
   }
 
   async putSkills(): Promise<void> {}
+
+  async postContribution(input: {
+    host?: string;
+    repo?: string;
+    added: number;
+    deleted: number;
+  }): Promise<void> {
+    this.contributions.push(input);
+  }
 
   get lastReport(): boolean | undefined {
     return this.reports[this.reports.length - 1];
@@ -200,7 +211,10 @@ export interface TurnHarness {
  */
 export function makeTurnHarness(
   messages: SDKMessage[],
-  opts: Parameters<typeof scriptedQuery>[1] = {},
+  opts: Parameters<typeof scriptedQuery>[1] & {
+    /** A real directory for the Turn to run in -- only tests of git-derived behaviour need one. */
+    projectDir?: string;
+  } = {},
 ): TurnHarness {
   const relay = new FakeRelay();
   const written: ConnectorState[] = [];
@@ -223,7 +237,7 @@ export function makeTurnHarness(
     config: {
       relayBaseUrl: "http://relay.test",
       createSecret: "s",
-      projectDir: "/tmp/project",
+      projectDir: opts.projectDir ?? "/tmp/project",
       provider: { type: "anthropic" },
     } as SessionContext["config"],
     providerEnv: {},
