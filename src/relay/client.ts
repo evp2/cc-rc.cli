@@ -86,6 +86,26 @@ async function checkTerminal(res: Response): Promise<void> {
 }
 
 /**
+ * How long a relay request may hang before it is treated as failed.
+ *
+ * Observed in production without this: a `setInFlight` call whose connection
+ * hung never resolved or rejected, so `duringTurn`'s cleanup -- and with it
+ * the connector's single, sequential main loop -- waited on it forever.
+ * `in_flight` stayed stuck true and no later command was ever picked up,
+ * indefinitely, because nothing was left to time it out.
+ */
+const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
+
+/** fetch(), bounded by {@link DEFAULT_REQUEST_TIMEOUT_MS} (or a caller-supplied override, so tests can prove the bound without waiting out a real hang). */
+function boundedFetch(
+  url: string,
+  init: RequestInit | undefined,
+  timeoutMs: number,
+): Promise<Response> {
+  return fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
+}
+
+/**
  * Thin fetch wrapper around the relay's JSON API. One instance per connector
  * process -- created via `RelayClient.create()`, which also registers the
  * session.
@@ -94,32 +114,48 @@ export class RelayClient {
   readonly sessionId: string;
   private readonly secret: string;
   private readonly relayBaseUrl: string;
+  private readonly requestTimeoutMs: number;
 
-  private constructor(relayBaseUrl: string, sessionId: string, secret: string) {
+  private constructor(
+    relayBaseUrl: string,
+    sessionId: string,
+    secret: string,
+    requestTimeoutMs: number,
+  ) {
     this.relayBaseUrl = relayBaseUrl;
     this.sessionId = sessionId;
     this.secret = secret;
+    this.requestTimeoutMs = requestTimeoutMs;
+  }
+
+  private fetch(url: string, init?: RequestInit): Promise<Response> {
+    return boundedFetch(url, init, this.requestTimeoutMs);
   }
 
   static async create(
     relayBaseUrl: string,
     createSecret: string,
     input: CreateSessionInput,
+    requestTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
   ): Promise<{ client: RelayClient; phoneUrl: string; netlifyUrl: string | undefined }> {
-    const res = await fetch(`${relayBaseUrl}/sessions`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "X-Create-Secret": createSecret,
+    const res = await boundedFetch(
+      `${relayBaseUrl}/sessions`,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "X-Create-Secret": createSecret,
+        },
+        body: JSON.stringify({
+          permission_mode: input.permissionMode,
+          provider_type: input.providerType,
+          provider_model: input.providerModel,
+          provider_region: input.providerRegion,
+          project_dir: input.projectDir,
+        }),
       },
-      body: JSON.stringify({
-        permission_mode: input.permissionMode,
-        provider_type: input.providerType,
-        provider_model: input.providerModel,
-        provider_region: input.providerRegion,
-        project_dir: input.projectDir,
-      }),
-    });
+      requestTimeoutMs,
+    );
     if (!res.ok) {
       throw new Error(`Failed to create session: HTTP ${res.status} ${await res.text()}`);
     }
@@ -131,7 +167,7 @@ export class RelayClient {
       netlify_url?: string;
     };
     return {
-      client: new RelayClient(relayBaseUrl, body.session_id, body.secret),
+      client: new RelayClient(relayBaseUrl, body.session_id, body.secret, requestTimeoutMs),
       phoneUrl: body.phone_url,
       netlifyUrl: body.netlify_url,
     };
@@ -149,8 +185,9 @@ export class RelayClient {
     relayBaseUrl: string,
     sessionId: string,
     secret: string,
+    requestTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
   ): Promise<RelayClient> {
-    const client = new RelayClient(relayBaseUrl, sessionId, secret);
+    const client = new RelayClient(relayBaseUrl, sessionId, secret, requestTimeoutMs);
     await client.getSession();
     return client;
   }
@@ -175,7 +212,7 @@ export class RelayClient {
   /** Throws {@link SessionEndedError} once the relay reports the session gone. */
   async pollCommands(since?: string): Promise<CommandRecord[]> {
     const qs = since ? `?since=${encodeURIComponent(since)}` : "";
-    const res = await fetch(
+    const res = await this.fetch(
       `${this.relayBaseUrl}/sessions/${this.sessionId}/commands${qs}`,
       { headers: this.authHeaders() },
     );
@@ -188,7 +225,7 @@ export class RelayClient {
   /** Throws {@link SessionEndedError} once the relay reports the session gone. */
   async postEvents(events: EventInput[]): Promise<number> {
     if (events.length === 0) return 0;
-    const res = await fetch(`${this.relayBaseUrl}/sessions/${this.sessionId}/events`, {
+    const res = await this.fetch(`${this.relayBaseUrl}/sessions/${this.sessionId}/events`, {
       method: "POST",
       headers: { "content-type": "application/json", ...this.authHeaders() },
       body: JSON.stringify({ events }),
@@ -223,7 +260,7 @@ export class RelayClient {
     const headers = opts.heartbeat
       ? { ...this.authHeaders(), "X-Crc-Client": "connector" }
       : this.authHeaders();
-    const res = await fetch(`${this.relayBaseUrl}/sessions/${this.sessionId}`, {
+    const res = await this.fetch(`${this.relayBaseUrl}/sessions/${this.sessionId}`, {
       headers,
     });
     await checkTerminal(res);
@@ -243,7 +280,7 @@ export class RelayClient {
    * waiting on, so callers log and move on rather than retry.
    */
   async putSkills(skills: SkillInfo[], localCommands: SkillInfo[]): Promise<void> {
-    const res = await fetch(`${this.relayBaseUrl}/sessions/${this.sessionId}/skills`, {
+    const res = await this.fetch(`${this.relayBaseUrl}/sessions/${this.sessionId}/skills`, {
       method: "PUT",
       headers: { "content-type": "application/json", ...this.authHeaders() },
       body: JSON.stringify({ skills, local_commands: localCommands }),
@@ -262,7 +299,7 @@ export class RelayClient {
    * Throws {@link SessionEndedError} once the relay reports the session gone.
    */
   async setInFlight(inFlight: boolean): Promise<void> {
-    const res = await fetch(`${this.relayBaseUrl}/sessions/${this.sessionId}/in-flight`, {
+    const res = await this.fetch(`${this.relayBaseUrl}/sessions/${this.sessionId}/in-flight`, {
       method: "PUT",
       headers: { "content-type": "application/json", ...this.authHeaders() },
       body: JSON.stringify({ in_flight: inFlight }),
@@ -275,7 +312,7 @@ export class RelayClient {
 
   /** Best-effort -- called during shutdown, failures are not actionable. */
   async end(): Promise<void> {
-    await fetch(`${this.relayBaseUrl}/sessions/${this.sessionId}/end`, {
+    await this.fetch(`${this.relayBaseUrl}/sessions/${this.sessionId}/end`, {
       method: "POST",
       headers: this.authHeaders(),
     }).catch(() => undefined);
