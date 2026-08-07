@@ -91,6 +91,30 @@ test("a confirmed Steer is promoted and both Turns settle", async () => {
   assert.equal(h.ctx.eventBuffer.filter((e) => e.type === "turn_complete").length, 2);
 });
 
+test("the drain loop stops once the abort signal fires, even if the SDK generator keeps yielding after it", async () => {
+  // Observed in production: a Stop mid-turn can leave the SDK's generator
+  // yielding further messages against an already-torn-down transport (each
+  // one failing getContextUsage with "Query closed"/"ProcessTransport is not
+  // ready for writing") instead of ending cleanly. Nothing inside the drain
+  // loop checked the signal, so it kept consuming those messages forever --
+  // duringTurn's claim-settling finally block was never reached, leaving
+  // in_flight stuck true and the phone's composer stuck on Stop.
+  const h = makeTurnHarness(
+    [init(), assistantText("before"), result(), assistantText("should not appear"), result("error_during_execution")],
+    {
+      onYield: async (message) => {
+        if (message.type === "result") h.ctx.currentTurn?.abortController.abort();
+      },
+    },
+  );
+
+  await runTurn(h.ctx, cmd("first"));
+
+  assert.equal(h.ledger.snapshot(), undefined, "the claim must not be left held");
+  const texts = h.ctx.eventBuffer.filter((e) => e.type === "assistant_text").map((e) => e.text);
+  assert.ok(!texts.includes("should not appear"), "nothing yielded after the abort fired should be processed");
+});
+
 test("a Stop before the query starts settles the claim and still completes the Turn", async () => {
   const h = makeTurnHarness([init(), result()]);
   // interrupt_at newer than the Command is what checkInterrupt acts on.

@@ -66,6 +66,16 @@ export async function runTurn(ctx: SessionContext, command: CommandRecord): Prom
       // `result` while one of its Background tasks is still running.
       ctx.currentQuery = activeQuery;
       for await (const message of activeQuery) {
+        // A Stop can land while the SDK's generator is mid-yield, and it is
+        // not trusted to end cleanly on its own once the transport it was
+        // reading from is gone -- observed in production as an endless run of
+        // "Query closed"/"ProcessTransport is not ready for writing" from the
+        // getContextUsage call below, with duringTurn's claim-settling
+        // `finally` never reached because this loop never stopped consuming.
+        // Bailing out here bounds it by the signal regardless of what the
+        // generator does; `for await` calls the iterator's `return()` on the
+        // way out, so the underlying query is told to stop too.
+        if (abortController.signal.aborted) break;
         if (message.type === "system" && message.subtype === "init") {
           ctx.sdkSessionId = message.session_id;
           persist(ctx, { sdkSessionId: ctx.sdkSessionId });
