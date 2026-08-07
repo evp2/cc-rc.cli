@@ -137,7 +137,7 @@ export class RelayClient {
     createSecret: string,
     input: CreateSessionInput,
     requestTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
-  ): Promise<{ client: RelayClient; phoneUrl: string; netlifyUrl: string | undefined }> {
+  ): Promise<{ client: RelayClient; phoneUrl: string; staticUrl: string | undefined }> {
     const res = await boundedFetch(
       `${relayBaseUrl}/sessions`,
       {
@@ -169,7 +169,7 @@ export class RelayClient {
     return {
       client: new RelayClient(relayBaseUrl, body.session_id, body.secret, requestTimeoutMs),
       phoneUrl: body.phone_url,
-      netlifyUrl: body.netlify_url,
+      staticUrl: body.netlify_url,
     };
   }
 
