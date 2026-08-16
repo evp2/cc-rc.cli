@@ -1,0 +1,27 @@
+name: SDK contract
+
+# Pins undocumented @anthropic-ai/claude-agent-sdk behavior the connector
+# depends on -- see test/contract/sdk.contract.ts. Runs against the real SDK
+# with a live credential, so this stays off the pull_request/push triggers in
+# ci.yml: nightly plus a manual button is enough to catch drift that isn't
+# tied to a version bump on our side (some of what's pinned is subprocess/CLI
+# behavior, which can shift without any change to package.json), without
+# spending the credential on every commit.
+on:
+  schedule:
+    - cron: "0 13 * * *" # 13:00 UTC daily
+  workflow_dispatch: {}
+
+jobs:
+  contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run test:contract
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
