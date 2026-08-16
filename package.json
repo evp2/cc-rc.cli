@@ -16,10 +16,11 @@
     "start": "tsx src/cli/index.ts",
     "typecheck": "tsc --noEmit",
     "test": "node --import tsx --test test/*.test.ts",
+    "test:contract": "node --import tsx --test test/contract/*.contract.ts",
     "prepublishOnly": "npm run typecheck && npm run build"
   },
   "dependencies": {
-    "@anthropic-ai/claude-agent-sdk": "0.3.213",
+    "@anthropic-ai/claude-agent-sdk": "^0.3.233",
     "qrcode-terminal": "^0.12.0"
   },
   "devDependencies": {
