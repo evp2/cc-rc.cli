@@ -1,4 +1,4 @@
-import type { Query, SDKMessage, SDKUserMessage, SlashCommand } from "@anthropic-ai/claude-agent-sdk";
+import type { Options, Query, SDKMessage, SDKUserMessage, SlashCommand } from "@anthropic-ai/claude-agent-sdk";
 
 import { AsyncQueue } from "../src/sdk/asyncQueue.ts";
 import { createSdkMessageMapper } from "../src/sdk/bridge.ts";
@@ -173,10 +173,15 @@ export function scriptedQuery(
     onYield?: (message: SDKMessage) => void | Promise<void>;
     /** Thrown from the drain after `throwAfter` messages, standing in for a subprocess that died mid-Turn. */
     throwAfter?: { count: number; error: Error };
+    /** Percentages `getContextUsage()` returns, one per call in order; the last value repeats once exhausted. Defaults to a fixed 42. */
+    contextPercentages?: number[];
+    /** Called synchronously with the `options` a real `query()` call would receive, so a test can reach into `options.hooks` (e.g. to invoke PreCompact) exactly as the real SDK would. */
+    onOptions?: (options: Options) => void;
   } = {},
 ): { query: SessionContext["query"]; streamed: string[] } {
   const streamed: string[] = [];
-  const query: SessionContext["query"] = () => {
+  const query: SessionContext["query"] = ({ options }) => {
+    opts.onOptions?.(options ?? {});
     const pending = new AsyncQueue<SDKMessage>();
     for (const m of messages) pending.push(m);
     pending.close();
@@ -220,7 +225,16 @@ export function scriptedQuery(
           opts.onStreamInput?.(text, (msg) => injected.push(msg));
         }
       },
-      getContextUsage: async () => ({ percentage: 42 }),
+      getContextUsage: (() => {
+        let calls = 0;
+        return async () => {
+          const seq = opts.contextPercentages;
+          if (!seq || seq.length === 0) return { percentage: 42 };
+          const percentage = seq[Math.min(calls, seq.length - 1)];
+          calls += 1;
+          return { percentage };
+        };
+      })(),
     };
     return q as unknown as Query;
   };
@@ -303,6 +317,7 @@ export function makeTurnHarness(
     questionPending: false,
     currentTurn: undefined,
     currentQuery: undefined,
+    contextWarningActive: false,
     flushChain: Promise.resolve(),
   };
 

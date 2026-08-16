@@ -5,7 +5,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
-import { runTurn } from "../src/session/turn.ts";
+import type { HookInput, Options } from "@anthropic-ai/claude-agent-sdk";
+
+import { contextWarningCrossing, runTurn } from "../src/session/turn.ts";
 import {
   assistantText,
   cmd,
@@ -217,6 +219,113 @@ test("a real Command steered into a running Auto-compact still counts as real ac
     true,
     "the human's own steered-in reply must still buzz -- it is not the routine idle compact",
   );
+});
+
+test("a Context-window warning fires once when the percentage crosses the default threshold", async () => {
+  const h = makeTurnHarness([init(), assistantText("hello"), result()], {
+    contextPercentages: [75],
+  });
+
+  await runTurn(h.ctx, cmd("say hello"));
+
+  const complete = h.ctx.eventBuffer.find((e) => e.type === "turn_complete");
+  assert.equal(complete?.context_percentage, 75);
+  assert.equal(complete?.context_warning, true);
+  assert.equal(h.ctx.contextWarningActive, true);
+});
+
+test("a Context-window warning stays below the default threshold silent", async () => {
+  const h = makeTurnHarness([init(), assistantText("hello"), result()], {
+    contextPercentages: [50],
+  });
+
+  await runTurn(h.ctx, cmd("say hello"));
+
+  const complete = h.ctx.eventBuffer.find((e) => e.type === "turn_complete");
+  assert.equal(complete?.context_warning, undefined);
+  assert.equal(h.ctx.contextWarningActive, false);
+});
+
+test("contextWarningCrossing fires only on the Turn that first reaches the threshold", () => {
+  const first = contextWarningCrossing(75, 70, false);
+  assert.deepEqual(first, { fire: true, active: true });
+
+  const second = contextWarningCrossing(80, 70, first.active);
+  assert.deepEqual(second, { fire: false, active: true }, "stays silent while still over threshold");
+});
+
+test("contextWarningCrossing re-arms once the percentage drops back below threshold", () => {
+  const crossed = contextWarningCrossing(75, 70, false);
+  const dropped = contextWarningCrossing(50, 70, crossed.active);
+  assert.deepEqual(dropped, { fire: false, active: false });
+
+  const recrossed = contextWarningCrossing(80, 70, dropped.active);
+  assert.deepEqual(recrossed, { fire: true, active: true }, "fires again on the second crossing");
+});
+
+test("a configured Context-window warning threshold overrides the default", async () => {
+  const h = makeTurnHarness([init(), assistantText("hello"), result()], {
+    contextPercentages: [60],
+    config: { contextWarningThresholdPercent: 55 },
+  });
+
+  await runTurn(h.ctx, cmd("say hello"));
+
+  const complete = h.ctx.eventBuffer.find((e) => e.type === "turn_complete");
+  assert.equal(complete?.context_warning, true, "60% crosses the configured 55% threshold");
+});
+
+test("a Context-window overflow fires when the SDK's PreCompact hook reports an auto trigger, independently of the warning tier", async () => {
+  let capturedOptions: Options | undefined;
+  const h = makeTurnHarness([init(), assistantText("working"), compactBoundary(), result()], {
+    contextPercentages: [80],
+    onOptions: (options) => {
+      capturedOptions = options;
+    },
+    onYield: async (message) => {
+      if (message.type === "system" && (message as { subtype?: string }).subtype === "compact_boundary") {
+        const hookInput = { hook_event_name: "PreCompact", trigger: "auto" } as unknown as HookInput;
+        await capturedOptions?.hooks?.PreCompact?.[0]?.hooks[0]?.(hookInput, undefined, {
+          signal: new AbortController().signal,
+        });
+      }
+    },
+  });
+
+  await runTurn(h.ctx, cmd("first"));
+
+  const overflow = h.ctx.eventBuffer.find((e) => e.context_overflow === true);
+  assert.ok(overflow, "an unplanned compaction produces a context_overflow status event");
+  assert.equal(overflow?.type, "status");
+  const withWarning = h.ctx.eventBuffer.find((e) => e.context_warning === true);
+  assert.ok(withWarning, "the same reading still independently crosses the warning threshold");
+  assert.equal(
+    h.ctx.contextWarningActive,
+    true,
+    "overflow firing must not suppress the independently-computed warning tier",
+  );
+});
+
+test("a Context-window overflow does not fire for a manual PreCompact trigger", async () => {
+  let capturedOptions: Options | undefined;
+  const h = makeTurnHarness([init(), assistantText("working"), compactBoundary(), result()], {
+    onOptions: (options) => {
+      capturedOptions = options;
+    },
+    onYield: async (message) => {
+      if (message.type === "system" && (message as { subtype?: string }).subtype === "compact_boundary") {
+        const hookInput = { hook_event_name: "PreCompact", trigger: "manual" } as unknown as HookInput;
+        await capturedOptions?.hooks?.PreCompact?.[0]?.hooks[0]?.(hookInput, undefined, {
+          signal: new AbortController().signal,
+        });
+      }
+    },
+  });
+
+  await runTurn(h.ctx, cmd("/compact"));
+
+  const overflow = h.ctx.eventBuffer.find((e) => e.context_overflow === true);
+  assert.equal(overflow, undefined, "a connector- or human-issued /compact is not an overflow");
 });
 
 test("a subprocess that dies mid-Turn leaves nothing held and says why", async () => {

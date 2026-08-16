@@ -49,3 +49,39 @@ test("a non-object inactivityCompact is rejected", () => {
     /inactivityCompact.*object/,
   );
 });
+
+test("contextWarningThresholdPercent is absent by default, leaving the 70% default in force", () => {
+  const config = loadConfig(writeConfig(base));
+  assert.equal(config.contextWarningThresholdPercent, undefined);
+});
+
+test("a valid contextWarningThresholdPercent is accepted", () => {
+  const config = loadConfig(writeConfig({ ...base, contextWarningThresholdPercent: 55 }));
+  assert.equal(config.contextWarningThresholdPercent, 55);
+});
+
+test("a contextWarningThresholdPercent of 100 is accepted", () => {
+  const config = loadConfig(writeConfig({ ...base, contextWarningThresholdPercent: 100 }));
+  assert.equal(config.contextWarningThresholdPercent, 100);
+});
+
+test("a contextWarningThresholdPercent of 0 is rejected", () => {
+  assert.throws(
+    () => loadConfig(writeConfig({ ...base, contextWarningThresholdPercent: 0 })),
+    /contextWarningThresholdPercent.*between 1 and 100/,
+  );
+});
+
+test("a contextWarningThresholdPercent above 100 is rejected", () => {
+  assert.throws(
+    () => loadConfig(writeConfig({ ...base, contextWarningThresholdPercent: 101 })),
+    /contextWarningThresholdPercent.*between 1 and 100/,
+  );
+});
+
+test("a non-numeric contextWarningThresholdPercent is rejected", () => {
+  assert.throws(
+    () => loadConfig(writeConfig({ ...base, contextWarningThresholdPercent: "70" })),
+    /contextWarningThresholdPercent/,
+  );
+});

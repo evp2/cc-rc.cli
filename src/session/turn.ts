@@ -1,13 +1,55 @@
-import type { Options, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
+import type { HookInput, Options, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 
 import { AsyncQueue, userTextMessage } from "../sdk/asyncQueue";
-import { PERMISSION_MODE } from "../config";
+import { DEFAULT_CONTEXT_WARNING_THRESHOLD_PERCENT, PERMISSION_MODE } from "../config";
 import { SessionEndedError, type CommandRecord } from "../relay/client";
 import { persist, publishSkills, trackBackgroundTasks } from "./commands";
 import { attributionKey, measureContribution, readPosition, type Position } from "./contribution";
 import type { SessionContext } from "./context";
 import { checkInterrupt, makeCanUseTool, watchForInterrupt } from "./watchers";
 import { selectLocalCommands, selectSkills } from "../skills";
+
+/**
+ * Whether this reading should fire a Context-window warning (see CONTEXT.md),
+ * and what `contextWarningActive` becomes afterward. Pure and exported so the
+ * edge-trigger's arm/re-arm behavior is directly testable across a sequence
+ * of readings, the same way Auto-compact's `isAutoCompactDue` is (loop.ts).
+ *
+ * Fires only on the reading that first reaches the threshold (`!active`);
+ * re-arms the moment a reading drops back below it, with no separate
+ * suppression flag needed beyond the one boolean this returns.
+ */
+export function contextWarningCrossing(
+  percentage: number,
+  thresholdPercent: number,
+  active: boolean,
+): { fire: boolean; active: boolean } {
+  if (percentage >= thresholdPercent) return { fire: !active, active: true };
+  return { fire: false, active: false };
+}
+
+/**
+ * Reports a Context-window overflow (see CONTEXT.md, ADR 0024): fires
+ * *before* the SDK compacts on its own, so the phone hears about it ahead of
+ * the compact rather than after -- but the hook's promise resolves
+ * immediately, taking no `block`/delay action, since there is nothing a
+ * phone-side human can do to stop an SDK-internal compaction mid-turn.
+ * `trigger: 'manual'` (a human's own `/compact`, or Auto-compact's) is
+ * deliberately ignored -- both are already-expected, source-tagged Commands,
+ * not the involuntary case this reports.
+ */
+function makePreCompactHook(ctx: SessionContext): (input: HookInput) => Promise<Record<string, never>> {
+  return async (input) => {
+    if (input.hook_event_name === "PreCompact" && input.trigger === "auto") {
+      ctx.eventBuffer.push({
+        type: "status",
+        text: "context window full — compacting automatically",
+        context_overflow: true,
+      });
+    }
+    return {};
+  };
+}
 
 /**
  * Runs a Turn to completion -- which, once a Steer lands, is really a chain
@@ -56,6 +98,7 @@ export async function runTurn(ctx: SessionContext, command: CommandRecord): Prom
     abortController,
     canUseTool,
     ...(ctx.sdkSessionId ? { resume: ctx.sdkSessionId } : {}),
+    hooks: { PreCompact: [{ hooks: [makePreCompactHook(ctx)] }] },
   };
 
   // Read before any of the Turn's work starts, so the range below spans
@@ -163,10 +206,23 @@ export async function runTurn(ctx: SessionContext, command: CommandRecord): Prom
         ) {
           try {
             const { percentage } = await activeQuery.getContextUsage();
+            const rounded = Math.round(percentage);
             const target = mapped.find(
               (evt) => evt.type === "turn_complete" || evt.type === "status",
             );
-            if (target) target.context_percentage = Math.round(percentage);
+            if (target) target.context_percentage = rounded;
+            // Context-window warning (see CONTEXT.md): edge-triggered off the
+            // same reading, independently of overflow above.
+            const threshold =
+              ctx.config.contextWarningThresholdPercent ??
+              DEFAULT_CONTEXT_WARNING_THRESHOLD_PERCENT;
+            const { fire, active } = contextWarningCrossing(
+              rounded,
+              threshold,
+              ctx.contextWarningActive,
+            );
+            ctx.contextWarningActive = active;
+            if (fire && target) target.context_warning = true;
           } catch (e) {
             console.error("Failed to get context usage:", (e as Error).message);
           }

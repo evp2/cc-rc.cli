@@ -24,6 +24,9 @@ export interface InactivityCompactConfig {
 /** Below this, a misconfigured value would fire Auto-compact on almost every Turn instead of after a genuine idle stretch. */
 export const MIN_INACTIVITY_COMPACT_MINUTES = 5;
 
+/** Applied when `contextWarningThresholdPercent` is absent -- the warning is always on, only its value is configurable. */
+export const DEFAULT_CONTEXT_WARNING_THRESHOLD_PERCENT = 70;
+
 export interface ConnectorConfig {
   relayBaseUrl: string;
   createSecret: string;
@@ -36,6 +39,13 @@ export interface ConnectorConfig {
    * that never reaches the model or the working tree.
    */
   inactivityCompact?: InactivityCompactConfig;
+  /**
+   * The percent of the model's context window in use at which a
+   * Context-window warning fires (see CONTEXT.md). Unlike `inactivityCompact`,
+   * this feature has no off switch -- only its threshold is configurable, so
+   * this is a plain percent rather than a nested config object.
+   */
+  contextWarningThresholdPercent?: number;
 }
 
 export function loadConfig(path: string): ConnectorConfig {
@@ -109,12 +119,22 @@ export function loadConfig(path: string): ConnectorConfig {
     inactivityCompact = { afterMinutes };
   }
 
+  let contextWarningThresholdPercent: number | undefined;
+  if (c.contextWarningThresholdPercent !== undefined) {
+    const pct = c.contextWarningThresholdPercent;
+    if (typeof pct !== "number" || !Number.isFinite(pct) || pct <= 0 || pct > 100) {
+      throw new Error("'contextWarningThresholdPercent' must be a number between 1 and 100 if present");
+    }
+    contextWarningThresholdPercent = pct;
+  }
+
   return {
     relayBaseUrl: relayBaseUrl.replace(/\/+$/, ""),
     createSecret,
     projectDir: resolve(projectDir),
     provider,
     ...(inactivityCompact ? { inactivityCompact } : {}),
+    ...(contextWarningThresholdPercent !== undefined ? { contextWarningThresholdPercent } : {}),
   };
 }
 

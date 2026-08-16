@@ -195,6 +195,7 @@ export async function runConnector(config: ConnectorConfig): Promise<RunHandle> 
     questionPending: false,
     currentTurn: undefined,
     currentQuery: undefined,
+    contextWarningActive: false,
     flushChain: Promise.resolve(),
   };
 

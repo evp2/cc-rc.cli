@@ -88,6 +88,17 @@ export interface SessionContext {
   currentTurn: CurrentTurn | undefined;
 
   /**
+   * Whether a Context-window warning has already fired for the current
+   * threshold crossing (see CONTEXT.md) -- the edge-trigger's own arm/suppress
+   * flag. Set once `context_percentage` crosses the configured threshold, and
+   * cleared the moment it drops back below, so the warning fires once per
+   * crossing rather than on every subsequent Turn. In-memory only, unlike
+   * Auto-compact's equivalent: nothing is lost by re-arming on restart, since
+   * a fresh process has no better guess than reading the next real percentage.
+   */
+  contextWarningActive: boolean;
+
+  /**
    * The most recently created turn's Query, for as long as its own generator
    * is still being drained. Live for the persistent kill-watcher to act
    * against for as long as a turn's subprocess is -- which can outlast the
