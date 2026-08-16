@@ -1,0 +1,286 @@
+import { spawn } from "node:child_process";
+import { closeSync, openSync, readFileSync } from "node:fs";
+
+import type { ConnectorConfig } from "../config";
+import { printPairingQrCode } from "../qr";
+import { RelayClient, SessionEndedError } from "../relay/client";
+import { runConnector } from "../session/loop";
+import {
+  ensureStateDir,
+  isProcessAlive,
+  liveConnector,
+  logPath,
+  readState,
+  statePath,
+  writeState,
+} from "../state";
+import { CONNECTOR_VERSION } from "../version";
+
+// How long `crc start` waits for the detached process to publish a session.
+const START_TIMEOUT_MS = 45_000;
+const START_POLL_MS = 250;
+
+/** Prints the share link, if this relay minted one -- absent against an older deployment. */
+function printShareUrl(staticUrl: string | undefined): void {
+  if (staticUrl) console.log(`Share (view + suggest, no secret needed):\n  ${staticUrl}\n`);
+}
+
+export async function runForeground(config: ConnectorConfig): Promise<void> {
+  const existing = liveConnector(config.projectDir);
+  if (existing && existing.pid !== process.pid) {
+    throw new Error(
+      `A connector is already running for ${config.projectDir} (pid ${existing.pid}).\n` +
+        `Stop it with 'crc stop' first, or check it with 'crc status'.`,
+    );
+  }
+
+  const handle = await runConnector(config);
+  console.log(
+    `Session ${handle.sessionId} ${handle.resumed ? "resumed" : "created"} for ${config.projectDir}`,
+  );
+  console.log(`Open on your phone:\n  ${handle.phoneUrl}\n`);
+  printPairingQrCode(handle.phoneUrl);
+  printShareUrl(handle.staticUrl);
+  console.log("");
+  await handle.done;
+}
+
+/**
+ * Spawns a detached copy of this process in `run` mode and waits for it to
+ * publish a session to the state file.
+ *
+ * The state file is the handoff: the child's stdout goes to a log, so the
+ * parent cannot scrape it for the phone URL the way a foreground run prints it.
+ */
+export async function start(config: ConnectorConfig, configPath: string): Promise<void> {
+  const existing = liveConnector(config.projectDir);
+  if (existing) {
+    console.log(`Already running for ${config.projectDir} (pid ${existing.pid}).`);
+    console.log(`Open on your phone:\n  ${existing.phoneUrl}\n`);
+    printPairingQrCode(existing.phoneUrl);
+    printShareUrl(existing.staticUrl);
+    return;
+  }
+
+  const entry = process.argv[1];
+  if (!entry || entry.endsWith(".ts")) {
+    throw new Error(
+      "'crc start' needs the built entrypoint -- run 'npm run build' and start " +
+        "via dist/index.js (or use 'crc run' to stay in the foreground).",
+    );
+  }
+
+  ensureStateDir();
+  const log = logPath(config.projectDir);
+  const logFd = openSync(log, "a");
+  const startedAt = Date.now();
+
+  const child = spawn(process.execPath, [entry, "run", "--config", configPath], {
+    detached: true,
+    stdio: ["ignore", logFd, logFd],
+    cwd: config.projectDir,
+    env: process.env,
+  });
+  child.unref();
+  closeSync(logFd);
+
+  // Wait for the child to publish its own pid alongside a session, so a state
+  // file left by a previous run can't be mistaken for this one's.
+  const deadline = Date.now() + START_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    const state = readState(config.projectDir);
+    if (state && state.pid === child.pid && Date.parse(state.startedAt) >= startedAt - 1000) {
+      console.log(`Connector started for ${config.projectDir} (pid ${state.pid}).`);
+      console.log(`Logging to ${log}`);
+      console.log(`Open on your phone:\n  ${state.phoneUrl}\n`);
+      printPairingQrCode(state.phoneUrl);
+      printShareUrl(state.staticUrl);
+      return;
+    }
+    if (child.pid && !isProcessAlive(child.pid)) break;
+    await sleep(START_POLL_MS);
+  }
+
+  throw new Error(
+    `Connector did not start within ${Math.round(START_TIMEOUT_MS / 1000)}s.\n` +
+      `Check the log for why:\n  ${log}\n\n${tailLog(log, 20)}`,
+  );
+}
+
+export async function stop(config: ConnectorConfig, end: boolean): Promise<void> {
+  const state = readState(config.projectDir);
+  if (!state) {
+    console.log(`No connector state for ${config.projectDir}. Nothing to stop.`);
+    return;
+  }
+
+  if (isProcessAlive(state.pid)) {
+    process.kill(state.pid, "SIGTERM");
+    const deadline = Date.now() + 15_000;
+    while (Date.now() < deadline && isProcessAlive(state.pid)) await sleep(200);
+    console.log(
+      isProcessAlive(state.pid)
+        ? `Connector (pid ${state.pid}) did not exit within 15s; leaving it be.`
+        : `Connector stopped (pid ${state.pid}).`,
+    );
+  } else {
+    console.log(`No connector running for ${config.projectDir}.`);
+  }
+
+  if (!end) {
+    console.log("Session left alive -- 'crc start' will resume it, no re-pair needed.");
+    return;
+  }
+
+  // Ending is done here rather than in the connector so that a stop signal and
+  // a deliberate end stay distinguishable: the connector never ends a session
+  // just because it is exiting.
+  try {
+    const client = await RelayClient.resume(
+      state.relayBaseUrl,
+      state.sessionId,
+      state.secret,
+    );
+    await client.end();
+    console.log("Session ended. The phone will need to re-pair after the next start.");
+  } catch (e) {
+    if (e instanceof SessionEndedError) {
+      console.log("Session had already ended.");
+    } else {
+      console.error("Failed to end the session:", (e as Error).message);
+    }
+  }
+  writeState({ ...state, sdkSessionId: undefined, commandCursor: undefined, inFlight: undefined });
+}
+
+/**
+ * Reports both halves of health, because they fail independently: the local
+ * process may be alive while the relay has not heard from it, and the session
+ * may be perfectly valid with no process running at all.
+ */
+export async function status(config: ConnectorConfig): Promise<void> {
+  const state = readState(config.projectDir);
+  console.log(`version       ${CONNECTOR_VERSION}`);
+  console.log(`project dir   ${config.projectDir}`);
+  console.log(`state file    ${statePath(config.projectDir)}`);
+  console.log(`log file      ${logPath(config.projectDir)}`);
+
+  if (!state) {
+    console.log(`process       not running (no state)`);
+    console.log(`session       none -- 'crc start' will create one`);
+    return;
+  }
+
+  const alive = isProcessAlive(state.pid);
+  console.log(`process       ${alive ? `running (pid ${state.pid})` : `not running (last pid ${state.pid})`}`);
+  console.log(`started at    ${state.startedAt}`);
+  if (state.lastError) console.log(`last error    ${state.lastError}`);
+  if (config.inactivityCompact) {
+    console.log(
+      `auto-compact  enabled (${config.inactivityCompact.afterMinutes}m idle), ` +
+        `last fired: ${state.lastAutoCompactAt ?? "never"}`,
+    );
+  }
+  for (const entry of state.inFlight ?? []) {
+    const fate =
+      entry.status === "running"
+        ? "will be reported as interrupted, not re-run"
+        : "will be reported as dropped, never ran";
+    console.log(`in flight     ${entry.seq} (${fate})`);
+  }
+
+  try {
+    const client = await RelayClient.resume(
+      state.relayBaseUrl,
+      state.sessionId,
+      state.secret,
+    );
+    const session = await client.getSession();
+    const lastSeen = session.last_connector_seen_at;
+    const ageMs = lastSeen ? Date.now() - Date.parse(lastSeen) : undefined;
+    console.log(`session       ${state.sessionId} (alive)`);
+    console.log(
+      `relay sees    ${
+        ageMs === undefined
+          ? "never heard from this connector"
+          : `${Math.round(ageMs / 1000)}s since last contact${ageMs < 15_000 ? "" : " -- the phone will treat it as unreachable"}`
+      }`,
+    );
+    console.log(`phone url     ${state.phoneUrl}`);
+    if (state.staticUrl) console.log(`share url     ${state.staticUrl}`);
+  } catch (e) {
+    if (e instanceof SessionEndedError) {
+      console.log(`session       ${state.sessionId} (ended -- next start rotates, phone must re-pair)`);
+    } else {
+      console.log(`session       unknown -- relay unreachable: ${(e as Error).message}`);
+    }
+  }
+
+  if (!alive) {
+    console.log(`\nStart it with 'crc start'.`);
+    const tail = tailLog(logPath(config.projectDir), 15);
+    if (tail) console.log(`\nLast log lines:\n${tail}`);
+  }
+}
+
+/**
+ * Re-renders the pairing code for the *current* session. This is the lossless
+ * path: a phone that pairs to a session it already had gets its whole
+ * transcript back. Rotating is deliberately not offered here -- it is
+ * `crc stop --end` followed by `crc start`.
+ *
+ * Defaults to the pairing QR (Control, embedded secret) -- this command
+ * overwhelmingly exists to re-pair a device the user themselves controls, and
+ * that device wants full access, not the read-plus-Suggest a share link now
+ * grants. `--share` switches to the Netlify share link instead, for handing
+ * to someone else to watch and weigh in on.
+ */
+export async function qr(config: ConnectorConfig, showShare: boolean): Promise<void> {
+  const state = readState(config.projectDir);
+  if (!state) {
+    throw new Error(
+      `No session for ${config.projectDir}. Start one with 'crc start'.`,
+    );
+  }
+
+  try {
+    await RelayClient.resume(state.relayBaseUrl, state.sessionId, state.secret);
+  } catch (e) {
+    if (e instanceof SessionEndedError) {
+      throw new Error(
+        `Session ${state.sessionId} has ended, so this code would not work.\n` +
+          `Run 'crc stop --end' then 'crc start' for a new one -- note that ` +
+          `discards the conversation.`,
+      );
+    }
+    console.error(`Warning: could not verify the session: ${(e as Error).message}`);
+  }
+
+  if (!isProcessAlive(state.pid)) {
+    console.log("Note: no connector is running, so the phone will stay blocked until 'crc start'.\n");
+  }
+
+  if (showShare) {
+    if (!state.staticUrl) {
+      throw new Error("This session predates the share link -- no --share URL to print.");
+    }
+    console.log(state.staticUrl);
+    return;
+  }
+
+  console.log(`Open on your phone:\n  ${state.phoneUrl}\n`);
+  printPairingQrCode(state.phoneUrl);
+  printShareUrl(state.staticUrl);
+}
+
+function tailLog(path: string, lines: number): string {
+  try {
+    return readFileSync(path, "utf-8").trimEnd().split("\n").slice(-lines).join("\n");
+  } catch {
+    return "";
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((res) => setTimeout(res, ms));
+}
