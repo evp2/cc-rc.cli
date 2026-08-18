@@ -1,6 +1,6 @@
 {
-  "relayBaseUrl": "https://okykx6ve84.execute-api.us-east-1.amazonaws.com/test",
-  "_createSecretB64": "MjI5YWU2NDVhMmNhOTY5MzVhNjNjZDY3ZGRhYWQyY2E5ZjE0NWY2ZTNkNDM0YmQw",
+  "relayBaseUrl": "https://i8drr7i63k.execute-api.us-east-1.amazonaws.com/dev",
+  "_createSecretB64": "YmNjMzU3N2EwYjA5ODM0NDZjYmVlZTI3YmZkNzk2Mzk0Y2E0ZTg0Yjc5OWUzMjRj",
   "projectDir": "",
   "provider": {
     "type": "anthropic"
