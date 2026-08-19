@@ -119,7 +119,16 @@ function resultSuccess(): SDKMessage {
     // 2 decimals, and 0.0001 rounds to "$0.00" there, which made
     // smoke.spec.ts's telemetry.costUsd > 0 assertion fail.
     total_cost_usd: 0.01,
-    usage: {},
+    // Real counts, not an empty object: the relay rejects a `usage` event
+    // missing any of them, and a rejected batch is retried forever, so an
+    // empty usage here wedges the whole event stream rather than just losing
+    // the usage row.
+    usage: {
+      input_tokens: 120,
+      output_tokens: 45,
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: 0,
+    },
     modelUsage: {},
     permission_denials: [],
     uuid: randomUUID(),
@@ -382,6 +391,15 @@ async function* subTurnLoop(
      * real timing.
      */
     confirmDelayMs?: number;
+    /**
+     * Starts the Steer's sub-turn with a fresh `system:init` and no `result`
+     * for the sub-turn it truncated -- the interrupt ordering, where the
+     * Steer is confirmed before (and instead of) the outcome of what it cut
+     * off. Every other persona here reports the truncated sub-turn's `result`
+     * first, which is the only ordering the connector's claim accounting was
+     * ever exercised against.
+     */
+    initBeforeResult?: boolean;
   } = {},
 ): AsyncGenerator<SDKMessage, void> {
   const signal = options.abortController?.signal;
@@ -423,8 +441,12 @@ async function* subTurnLoop(
     }
     if (signal?.aborted) return;
 
-    yield resultSuccess(); // this sub-turn ends, having said nothing further
-    yield systemInit(); // the Steer's own sub-turn begins, same query
+    // This sub-turn ends, having said nothing further, and the Steer's own
+    // sub-turn begins in the same query. Under initBeforeResult the truncated
+    // one is simply cut off: the `init` is all the connector ever hears about
+    // it, so a Command released only by its own `result` is never released.
+    if (!opts.initBeforeResult) yield resultSuccess();
+    yield systemInit();
     announce = steered;
     // Loop back: the reply about to be announced is itself steppable and
     // steerable, not an instant, un-interruptible finish.
@@ -471,6 +493,22 @@ async function* steeringNoConfirmPersona(
   }
   yield assistantText("finished without being steered further");
   yield resultSuccess();
+}
+
+/**
+ * Confirms a Steer with a fresh `system:init` before the sub-turn it
+ * truncated has reported any `result` -- the interrupt ordering. The
+ * connector must release the superseded Command on the `init` itself, since
+ * nothing else ever will; getting this wrong holds it for the life of the
+ * process and leaves the phone's brake and Thinking indicator stuck on
+ * against a Turn that finished, which is invisible in the transcript.
+ */
+async function* steeringInitFirstPersona(
+  options: Options,
+  mailbox: AsyncQueue<SDKUserMessage>,
+): AsyncGenerator<SDKMessage, void> {
+  yield systemInit();
+  yield* subTurnLoop(options, mailbox, { initBeforeResult: true });
 }
 
 /** Like {@link steeringPersona}, but see `confirmDelayMs` on {@link subTurnLoop}. */
@@ -634,6 +672,8 @@ function dispatch(
       return steeringSlowConfirmPersona(options, mailbox);
     case "steering-no-confirm":
       return steeringNoConfirmPersona(options, mailbox);
+    case "steering-init-first":
+      return steeringInitFirstPersona(options, mailbox);
     default:
       throw new Error(`Unknown CRC_FAKE_SDK persona: '${persona}'`);
   }
@@ -660,6 +700,7 @@ const FAKE_SUPPORTED_COMMANDS: Record<string, SlashCommand[]> = {
   "steering-with-question": [],
   "steering-slow-confirm": [],
   "steering-no-confirm": [],
+  "steering-init-first": [],
 };
 
 function sleep(ms: number): Promise<void> {

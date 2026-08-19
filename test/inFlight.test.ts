@@ -98,7 +98,7 @@ test("a confirmed Steer becomes the active Command and is settled by its own res
   await ledger.duringTurn(cmd("first"), controller.signal, async (claims) => {
     await claims.steer(steer);
     await claims.settleActive(); // the truncated Turn's own result
-    claims.confirmSteer(); // the fresh init
+    await claims.confirmSteer(); // the fresh init
     assert.equal(claims.activeSeq, steer.seq);
     assert.equal(claims.pendingSteerSeq, undefined);
     assert.deepEqual(ledger.snapshot(), [{ seq: steer.seq, text: "a correction", status: "running" }]);
@@ -108,6 +108,32 @@ test("a confirmed Steer becomes the active Command and is settled by its own res
   assert.equal(ledger.snapshot(), undefined);
   // Never flickers false across the seam between the two Turns: the Steer was
   // already held when the truncated Turn settled.
+  assert.deepEqual(relay.reports, [true, false]);
+});
+
+test("a Steer confirmed before the truncated sub-turn's result releases it anyway", async () => {
+  const { ledger, relay } = makeLedger();
+  const controller = new AbortController();
+  const first = cmd("first");
+  const steer = cmd("a correction");
+
+  // The interrupt ordering: the fresh `init` arrives before (and instead of)
+  // any `result` for the sub-turn the Steer cut off, so settleActive() never
+  // runs for `first`. Nothing else names it once activeSeq moves on, so a
+  // Command released only there is held for the life of the process.
+  await ledger.duringTurn(first, controller.signal, async (claims) => {
+    await claims.steer(steer);
+    await claims.confirmSteer();
+    assert.equal(claims.activeSeq, steer.seq);
+    assert.deepEqual(ledger.snapshot(), [
+      { seq: steer.seq, text: "a correction", status: "running" },
+    ]);
+    await claims.settleActive(); // the steered Turn's own result
+  });
+
+  assert.equal(ledger.snapshot(), undefined);
+  // Still never flickers false mid-Turn: the Steer was promoted before the
+  // Command it superseded was released.
   assert.deepEqual(relay.reports, [true, false]);
 });
 

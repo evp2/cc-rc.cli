@@ -38,8 +38,11 @@ export interface TurnClaims {
   readonly pendingSteerSeq: string | undefined;
   /** Claims a Command as this Turn's one Steer, before it is streamed in. */
   steer(command: CommandRecord): Promise<void>;
-  /** A fresh `init` confirmed the Steer: it becomes the Turn's active Command. */
-  confirmSteer(): void;
+  /**
+   * A fresh `init` confirmed the Steer: it becomes the Turn's active Command,
+   * and whatever was active before it is released.
+   */
+  confirmSteer(): Promise<void>;
   /** The Steer never reached the query. Reported to the phone, not left claimed. */
   abandonSteer(): Promise<void>;
   /** This sub-turn produced its `result`. */
@@ -49,12 +52,20 @@ export interface TurnClaims {
 class TurnClaimsImpl implements TurnClaims {
   activeSeq: string;
   pendingSteerSeq: string | undefined;
+  /**
+   * Every Command this Turn has made active, including ones a later Steer
+   * superseded. `activeSeq` alone is not enough to unwind by: it is
+   * overwritten on each confirmed Steer, so a Command it no longer names is a
+   * Command nothing else would ever release.
+   */
+  readonly claimedSeqs = new Set<string>();
 
   constructor(
     activeSeq: string,
     private readonly owner: InFlight,
   ) {
     this.activeSeq = activeSeq;
+    this.claimedSeqs.add(activeSeq);
   }
 
   async steer(command: CommandRecord): Promise<void> {
@@ -62,12 +73,25 @@ class TurnClaimsImpl implements TurnClaims {
     await this.owner.hold(command, "queued");
   }
 
-  confirmSteer(): void {
+  /**
+   * Promotes the Steer before releasing the Command it supersedes, so the
+   * relay-facing fact never flickers false across the seam between two
+   * sub-turns of the same Turn.
+   *
+   * The release is not redundant with settleActive(): that only runs if the
+   * superseded sub-turn reports a `result`, and an `init` can arrive first --
+   * or instead. Settling here is idempotent, so the ordinary
+   * result-then-init case reaches this having nothing left to release.
+   */
+  async confirmSteer(): Promise<void> {
     const seq = this.pendingSteerSeq;
     if (!seq) return;
+    const superseded = this.activeSeq;
     this.pendingSteerSeq = undefined;
     this.activeSeq = seq;
+    this.claimedSeqs.add(seq);
     this.owner.promote(seq);
+    if (superseded !== seq) await this.owner.settle(superseded);
   }
 
   async abandonSteer(): Promise<void> {
@@ -213,8 +237,11 @@ export class InFlight {
         else await this.settle(claims.pendingSteerSeq);
       }
       // Idempotent: settled by the body already in the ordinary case, so this
-      // only does anything for an abort or an unexpected error.
-      await this.settle(claims.activeSeq);
+      // only does anything for an abort or an unexpected error. Every Command
+      // the Turn made active is swept, not just the last -- a Turn steered
+      // more than once has more than one, and a Command left behind by a
+      // superseded sub-turn is held for the life of the process.
+      for (const seq of claims.claimedSeqs) await this.settle(seq);
     }
   }
 

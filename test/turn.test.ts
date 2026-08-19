@@ -97,6 +97,39 @@ test("a confirmed Steer is promoted and both Turns settle", async () => {
   assert.equal(h.ctx.eventBuffer.filter((e) => e.type === "turn_complete").length, 2);
 });
 
+test("a Steer confirmed before the truncated sub-turn's result still releases it", async () => {
+  // The interrupt ordering: the fresh `init` opens the Steer's sub-turn
+  // before -- and instead of -- any `result` for the sub-turn it cut off, so
+  // settleActive() never runs for the original Command. Once the Steer
+  // becomes active nothing else names it, and it stays held for the life of
+  // the process with the phone's brake and Thinking indicator stuck on.
+  const steer = cmd("a correction");
+  let steered = false;
+  let h: TurnHarness;
+  h = makeTurnHarness(
+    [init(), assistantText("working"), init("sdk-2"), assistantText("corrected"), result()],
+    {
+      // Claimed while the first sub-turn is still working, so the `init`
+      // below is the first thing the connector hears after it -- there is no
+      // `result` for the sub-turn the Steer truncated.
+      onYield: async (message) => {
+        if (message.type === "assistant" && !steered) {
+          steered = true;
+          await h.ledger.current()!.steer(steer);
+        }
+      },
+    },
+  );
+
+  await runTurn(h.ctx, cmd("first"));
+
+  assert.equal(h.ledger.snapshot(), undefined, "neither Command is left held");
+  // Still no flicker mid-Turn: the Steer was promoted before the Command it
+  // superseded was released.
+  assert.deepEqual(h.relay.reports, [true, false]);
+  assert.equal(h.ctx.sdkSessionId, "sdk-2");
+});
+
 test("the drain loop stops once the abort signal fires, even if the SDK generator keeps yielding after it", async () => {
   // Observed in production: a Stop mid-turn can leave the SDK's generator
   // yielding further messages against an already-torn-down transport (each

@@ -149,7 +149,7 @@ export async function runTurn(ctx: SessionContext, command: CommandRecord): Prom
           // Steer just landed: promote whichever Command was streamed in to
           // `running` and make it the one this loop is now tracking. A no-op
           // on the very first `init`, where nothing is pending yet.
-          claims.confirmSteer();
+          await claims.confirmSteer();
           // Each sub-turn gets its own allowance to be Steered again -- a
           // steered exchange is a conversation, not a single correction.
           if (ctx.currentTurn) ctx.currentTurn.steeredThisSubTurn = false;
