@@ -1,6 +1,6 @@
-import type { CanUseTool, PermissionResult, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
+import type { CanUseTool, PermissionResult } from "@anthropic-ai/claude-agent-sdk";
 
-import { AsyncQueue, userTextMessage } from "../sdk/asyncQueue";
+import { userTextMessage } from "../sdk/asyncQueue";
 import { SessionEndedError, type CommandRecord } from "../relay/client";
 import type { SessionContext } from "./context";
 
@@ -94,11 +94,8 @@ export function watchForSteers(ctx: SessionContext): () => void {
           // discard rather than deliver into a query that is already ending.
           await held.abandonSteer();
         } else {
-          const steerInput = new AsyncQueue<SDKUserMessage>();
-          steerInput.push(userTextMessage(first.text, { priority: "now" }));
-          steerInput.close();
           try {
-            await ctx.currentQuery.streamInput(steerInput);
+            turn.pushSteer(userTextMessage(first.text, { priority: "now" }));
           } catch (e) {
             // It never reached the query, so no `init` is ever coming to
             // confirm it and no Turn will ever end holding it. Said out loud

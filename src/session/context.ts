@@ -19,6 +19,19 @@ export interface CurrentTurn {
   abortController: AbortController;
   /** Whether this specific sub-turn has already taken its one allowed Steer. */
   steeredThisSubTurn: boolean;
+  /**
+   * Delivers a Steer into the Turn's own still-open prompt queue -- the same
+   * iterable `query()` was called with, which the SDK drains via its own
+   * internal `streamInput()` call for the Turn's whole life. A *second*
+   * `streamInput()` call (a fresh queue per Steer, as this used to work) ends
+   * with the SDK closing the CLI subprocess's stdin the moment that queue's
+   * one message is delivered -- which kills the first, still-running
+   * `streamInput()` call along with it, and with it every future
+   * `AskUserQuestion` in the Turn (its only channel, `canUseTool`, throws
+   * "Stream closed" instead of ever reaching the phone). Pushing into the
+   * one queue that was never closed avoids ending stdin at all.
+   */
+  pushSteer: (message: SDKUserMessage) => void;
 }
 
 /**
@@ -107,7 +120,6 @@ export interface SessionContext {
   currentQuery:
     | {
         stopTask(taskId: string): Promise<void>;
-        streamInput(stream: AsyncIterable<SDKUserMessage>): Promise<void>;
         getContextUsage(): Promise<{ percentage: number }>;
       }
     | undefined;

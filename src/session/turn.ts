@@ -65,7 +65,6 @@ function makePreCompactHook(ctx: SessionContext): (input: HookInput) => Promise<
 export async function runTurn(ctx: SessionContext, command: CommandRecord): Promise<void> {
   const text = command.text;
   const abortController = new AbortController();
-  ctx.currentTurn = { abortController, steeredThisSubTurn: false };
   // Whether this Turn chain should count as "a human showed up" for
   // Auto-compact's idle clock. Starts true for any ordinary Command; an
   // Auto-compact's own initiating Command does not count, but a Steer
@@ -84,6 +83,11 @@ export async function runTurn(ctx: SessionContext, command: CommandRecord): Prom
   // accepts a mid-turn message into when the query began this way.
   const input = new AsyncQueue<SDKUserMessage>();
   input.push(userTextMessage(text));
+  ctx.currentTurn = {
+    abortController,
+    steeredThisSubTurn: false,
+    pushSteer: (message) => input.push(message),
+  };
   const options: Options = {
     // Without this the SDK sends a minimal system prompt that never states
     // the working directory, so `cwd` below is honoured by the subprocess but

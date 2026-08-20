@@ -637,6 +637,14 @@ function scriptFor(
   return (async function* () {
     const first = await takeOne(prompt);
     if (first === undefined) return;
+    // The real SDK drains the whole prompt iterable for the query's entire
+    // life via its own internal `streamInput()` call -- a Steer now rides
+    // that same channel (pushed straight into the Turn's open queue) rather
+    // than arriving through a second, separate `streamInput()` call. Mirror
+    // that here so a persona reading `mailbox` still sees it.
+    void (async () => {
+      for await (const message of prompt) mailbox.push(message);
+    })();
     yield* dispatch(persona, textOf(first), options, mailbox);
   })();
 }
@@ -708,11 +716,7 @@ function sleep(ms: number): Promise<void> {
 }
 
 /** Builds a `Query`-shaped object around a plain async generator, adding the handful of methods the connector actually calls. */
-function buildQuery(
-  gen: AsyncGenerator<SDKMessage, void>,
-  commands: SlashCommand[],
-  mailbox: AsyncQueue<SDKUserMessage>,
-): Query {
+function buildQuery(gen: AsyncGenerator<SDKMessage, void>, commands: SlashCommand[]): Query {
   const q = {
     [Symbol.asyncIterator]() {
       return q;
@@ -725,14 +729,6 @@ function buildQuery(
     // Background task. The fake persona settles its own tasks on a timer, so
     // this only needs to not throw -- the real SDK is what actually stops one.
     stopTask: async (): Promise<void> => undefined,
-    // Mirrors the real SDK's Query.streamInput: the connector's turn-scoped
-    // poller (the steering seam) calls this to inject a mid-turn Command.
-    // Draining into the mailbox rather than yielding straight into `gen`
-    // matches the real shape -- input and output are separate streams -- and
-    // leaves it up to the persona whether and when to react.
-    streamInput: async (stream: AsyncIterable<SDKUserMessage>): Promise<void> => {
-      for await (const message of stream) mailbox.push(message);
-    },
     // Fixed rather than persona-specific: no scripted turn currently needs a
     // particular reading, only that one is available for the phone to render.
     getContextUsage: async () => ({ percentage: FAKE_CONTEXT_PERCENTAGE }),
@@ -744,6 +740,6 @@ export function fakeQuery(persona: string): typeof realQuery {
   return ({ prompt, options }) => {
     const mailbox = new AsyncQueue<SDKUserMessage>();
     const gen = scriptFor(persona, prompt, options ?? {}, mailbox);
-    return buildQuery(gen, FAKE_SUPPORTED_COMMANDS[persona] ?? [], mailbox);
+    return buildQuery(gen, FAKE_SUPPORTED_COMMANDS[persona] ?? []);
   };
 }
