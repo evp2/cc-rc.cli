@@ -30,8 +30,14 @@ export interface ConnectorState {
   sessionId: string;
   secret: string;
   phoneUrl: string;
-  /** The Netlify share link for this session, if the relay minted one -- full access, no secret. */
+  /** The Netlify share link for this session, if the relay minted one -- view plus Suggest, no secret. */
   staticUrl?: string;
+  /**
+   * The Netlify Control link for this session -- the short, typeable
+   * counterpart to `phoneUrl`, which is only realistically transferable by
+   * scanning its QR. Absent against a relay deployment that predates it.
+   */
+  controlUrl?: string;
   /**
    * Seq of the most recent command *claimed*, written before the turn runs
    * rather than after it succeeds. A command at or below this is never executed

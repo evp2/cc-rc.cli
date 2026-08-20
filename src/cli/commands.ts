@@ -25,6 +25,15 @@ function printShareUrl(staticUrl: string | undefined): void {
   if (staticUrl) console.log(`Share (view + suggest, no secret needed):\n  ${staticUrl}\n`);
 }
 
+/**
+ * Prints the short Control link -- the one to type when the QR above cannot be
+ * scanned. Labelled as full access because it is: unlike the share link, this
+ * one drives the agent, and anyone who reads it over a shoulder has it.
+ */
+function printControlUrl(controlUrl: string | undefined): void {
+  if (controlUrl) console.log(`Control (full access -- do not share):\n  ${controlUrl}\n`);
+}
+
 export async function runForeground(config: ConnectorConfig): Promise<void> {
   const existing = liveConnector(config.projectDir);
   if (existing && existing.pid !== process.pid) {
@@ -40,6 +49,7 @@ export async function runForeground(config: ConnectorConfig): Promise<void> {
   );
   console.log(`Open on your phone:\n  ${handle.phoneUrl}\n`);
   printPairingQrCode(handle.phoneUrl);
+  printControlUrl(handle.controlUrl);
   printShareUrl(handle.staticUrl);
   console.log("");
   await handle.done;
@@ -58,6 +68,7 @@ export async function start(config: ConnectorConfig, configPath: string): Promis
     console.log(`Already running for ${config.projectDir} (pid ${existing.pid}).`);
     console.log(`Open on your phone:\n  ${existing.phoneUrl}\n`);
     printPairingQrCode(existing.phoneUrl);
+    printControlUrl(existing.controlUrl);
     printShareUrl(existing.staticUrl);
     return;
   }
@@ -94,6 +105,7 @@ export async function start(config: ConnectorConfig, configPath: string): Promis
       console.log(`Logging to ${log}`);
       console.log(`Open on your phone:\n  ${state.phoneUrl}\n`);
       printPairingQrCode(state.phoneUrl);
+      printControlUrl(state.controlUrl);
       printShareUrl(state.staticUrl);
       return;
     }
@@ -207,6 +219,7 @@ export async function status(config: ConnectorConfig): Promise<void> {
       }`,
     );
     console.log(`phone url     ${state.phoneUrl}`);
+    if (state.controlUrl) console.log(`control url   ${state.controlUrl}`);
     if (state.staticUrl) console.log(`share url     ${state.staticUrl}`);
   } catch (e) {
     if (e instanceof SessionEndedError) {
@@ -243,8 +256,9 @@ export async function qr(config: ConnectorConfig, showShare: boolean): Promise<v
     );
   }
 
+  let client: RelayClient | undefined;
   try {
-    await RelayClient.resume(state.relayBaseUrl, state.sessionId, state.secret);
+    client = await RelayClient.resume(state.relayBaseUrl, state.sessionId, state.secret);
   } catch (e) {
     if (e instanceof SessionEndedError) {
       throw new Error(
@@ -268,8 +282,15 @@ export async function qr(config: ConnectorConfig, showShare: boolean): Promise<v
     return;
   }
 
+  // A session started before control codes existed has none in its state file;
+  // asking the relay mints one, so `crc qr` is how an already-running session
+  // gets its Control link without a restart.
+  const controlUrl =
+    state.controlUrl ?? (await client?.fetchControlUrl().catch(() => undefined));
+
   console.log(`Open on your phone:\n  ${state.phoneUrl}\n`);
   printPairingQrCode(state.phoneUrl);
+  printControlUrl(controlUrl);
   printShareUrl(state.staticUrl);
 }
 

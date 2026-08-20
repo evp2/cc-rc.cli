@@ -156,7 +156,12 @@ export class RelayClient {
     createSecret: string,
     input: CreateSessionInput,
     requestTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
-  ): Promise<{ client: RelayClient; phoneUrl: string; staticUrl: string | undefined }> {
+  ): Promise<{
+    client: RelayClient;
+    phoneUrl: string;
+    staticUrl: string | undefined;
+    controlUrl: string | undefined;
+  }> {
     const res = await boundedFetch(
       `${relayBaseUrl}/sessions`,
       {
@@ -184,11 +189,14 @@ export class RelayClient {
       phone_url: string;
       // Absent against an older relay deployment that predates this field.
       netlify_url?: string;
+      // Likewise -- see `fetchControlUrl` for the session that predates it.
+      control_url?: string;
     };
     return {
       client: new RelayClient(relayBaseUrl, body.session_id, body.secret, requestTimeoutMs),
       phoneUrl: body.phone_url,
       staticUrl: body.netlify_url,
+      controlUrl: body.control_url,
     };
   }
 
@@ -218,6 +226,23 @@ export class RelayClient {
    */
   phoneUrl(): string {
     return `${this.relayBaseUrl}/?s=${this.sessionId}&k=${encodeURIComponent(this.secret)}`;
+  }
+
+  /**
+   * The short Control URL for this session, asked of the relay rather than
+   * rebuilt like {@link phoneUrl}: the code lives only in the session record,
+   * and a session created before control codes existed has one minted on the
+   * first ask. Undefined against a relay that predates the route, which is the
+   * one case a caller has nothing to print.
+   */
+  async fetchControlUrl(): Promise<string | undefined> {
+    const res = await this.fetch(
+      `${this.relayBaseUrl}/sessions/${this.sessionId}/control-code`,
+      { method: "POST", headers: this.authHeaders() },
+    );
+    if (!res.ok) return undefined;
+    const body = (await res.json()) as { control_url?: string };
+    return body.control_url;
   }
 
   get sessionSecret(): string {

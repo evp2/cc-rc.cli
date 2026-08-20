@@ -66,6 +66,7 @@ export async function maybeSubmitAutoCompact(ctx: SessionContext): Promise<void>
 export interface RunHandle {
   phoneUrl: string;
   staticUrl: string | undefined;
+  controlUrl: string | undefined;
   sessionId: string;
   /** False when the session was newly minted, so callers can say which it was. */
   resumed: boolean;
@@ -86,6 +87,7 @@ async function acquireSession(config: ConnectorConfig): Promise<{
   client: RelayClient;
   phoneUrl: string;
   staticUrl: string | undefined;
+  controlUrl: string | undefined;
   resumed: ConnectorState | undefined;
 }> {
   const previous = readState(config.projectDir);
@@ -106,6 +108,11 @@ async function acquireSession(config: ConnectorConfig): Promise<{
         client,
         phoneUrl: previous.phoneUrl || client.phoneUrl(),
         staticUrl: previous.staticUrl,
+        // Asked for only when the state file has none, which is exactly the
+        // session that predates control codes. Best-effort: an unreachable or
+        // older relay costs a printed Control link, never the restart.
+        controlUrl:
+          previous.controlUrl ?? (await client.fetchControlUrl().catch(() => undefined)),
         resumed: previous,
       };
     } catch (e) {
@@ -114,7 +121,7 @@ async function acquireSession(config: ConnectorConfig): Promise<{
     }
   }
 
-  const { client, phoneUrl, staticUrl } = await RelayClient.create(
+  const { client, phoneUrl, staticUrl, controlUrl } = await RelayClient.create(
     config.relayBaseUrl,
     config.createSecret,
     {
@@ -127,7 +134,7 @@ async function acquireSession(config: ConnectorConfig): Promise<{
   );
   // Rotating discards the conversation along with the session, so a blank
   // transcript on the phone always means a genuinely fresh Claude.
-  return { client, phoneUrl, staticUrl, resumed: undefined };
+  return { client, phoneUrl, staticUrl, controlUrl, resumed: undefined };
 }
 
 /**
@@ -136,7 +143,7 @@ async function acquireSession(config: ConnectorConfig): Promise<{
  */
 export async function runConnector(config: ConnectorConfig): Promise<RunHandle> {
   const providerEnv = buildProviderEnv(config.provider);
-  const { client, phoneUrl, staticUrl, resumed } = await acquireSession(config);
+  const { client, phoneUrl, staticUrl, controlUrl, resumed } = await acquireSession(config);
 
   // Declared before the context so the ledger's dependencies can close over
   // it: the ledger persists and emits through the same paths everything else
@@ -173,6 +180,7 @@ export async function runConnector(config: ConnectorConfig): Promise<RunHandle> 
       secret: client.sessionSecret,
       phoneUrl,
       staticUrl,
+      controlUrl,
       commandCursor: resumed?.commandCursor,
       sdkSessionId: resumed?.sdkSessionId,
       inFlight: undefined,
@@ -326,7 +334,14 @@ export async function runConnector(config: ConnectorConfig): Promise<RunHandle> 
     await shutdown();
   })();
 
-  return { phoneUrl, staticUrl, sessionId: client.sessionId, resumed: resumed !== undefined, done };
+  return {
+    phoneUrl,
+    staticUrl,
+    controlUrl,
+    sessionId: client.sessionId,
+    resumed: resumed !== undefined,
+    done,
+  };
 }
 
 function sleep(ms: number): Promise<void> {

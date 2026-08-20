@@ -127,6 +127,24 @@ Without a subcommand, `crc` runs in the foreground.
 `crc start` detaches and returns, printing the phone URL and a scannable QR
 code. Logs go to `~/.claude-remote-control/<key>.log`.
 
+Underneath the QR it prints two short links, for the two things people actually
+do with a session:
+
+```
+Control (full access -- do not share):
+  https://claude-rc.netlify.app/p/1234567890
+
+Share (view + suggest, no secret needed):
+  https://claude-rc.netlify.app/12345678
+```
+
+The Control link is the one to type when the QR cannot be scanned — a second
+phone, a laptop, a camera that will not focus. Ten digits, and enough on its own
+to drive the agent, so treat it exactly as you would the QR code: anyone who
+reads it over your shoulder has your session until you end it. The share link is
+eight digits and grants only reading the transcript and writing Suggestions.
+`crc qr --share` prints the share link alone, for pasting somewhere.
+
 ### Restarting does not cost you a re-pair
 
 The connector records its session in `~/.claude-remote-control/<key>.json`
