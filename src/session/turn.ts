@@ -251,13 +251,20 @@ export async function runTurn(ctx: SessionContext, command: CommandRecord): Prom
       if (abortController.signal.aborted) {
         console.log("Turn stopped.");
       } else {
-        console.error("Turn failed:", (e as Error).message);
+        const message = (e as Error).message;
+        console.error("Turn failed:", message);
         // A `result` message (mapped to turn_complete/error by mapSdkMessage)
         // already reported this turn's outcome -- avoid a redundant second
         // error event for the same failure when the query() generator also
         // rejects after streaming it.
-        if (!sawResult) {
-          ctx.eventBuffer.push({ type: "error", text: (e as Error).message, is_error: true });
+        //
+        // `[ede_diagnostic]` is the SDK's own internal consistency-check tag
+        // (seen firing harmlessly around a steered/aborted sub-turn) -- never
+        // meant for a human to read, so it's logged above and left out of the
+        // banner rather than shown as a scary red "error" for work that in
+        // fact went on to succeed.
+        if (!sawResult && !message.startsWith("[ede_diagnostic]")) {
+          ctx.eventBuffer.push({ type: "error", text: message, is_error: true });
         }
       }
     } finally {

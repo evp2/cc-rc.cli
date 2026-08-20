@@ -374,6 +374,19 @@ test("a subprocess that dies mid-Turn leaves nothing held and says why", async (
   assert.ok(errors.some((t) => /subprocess exited/.test(t!)));
 });
 
+test("an [ede_diagnostic]-tagged throw is logged, not banner'd -- it's the SDK's own internal marker, not a real failure", async () => {
+  const h = makeTurnHarness([init(), assistantText("working"), result()], {
+    throwAfter: {
+      count: 2,
+      error: new Error("[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=null"),
+    },
+  });
+
+  await runTurn(h.ctx, cmd("first"));
+
+  assert.equal(h.ctx.eventBuffer.some((e) => e.is_error), false);
+});
+
 test("context usage is stamped on the turn_complete and on a compaction", async () => {
   const h = makeTurnHarness([init(), compactBoundary(), result()]);
 
